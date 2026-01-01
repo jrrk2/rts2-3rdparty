@@ -1,5 +1,5 @@
 #include <dome.h>
-#include <logstream.h>
+#include <unistd.h>
 
 using namespace rts2dome;
 
@@ -7,44 +7,17 @@ class VirtualDome : public Dome
 {
 public:
     VirtualDome(int argc, char **argv)
-        : Dome(argc, argv, DEVICE_TYPE_DOME, false),
-          domestate(DS_CLOSED),
+        : Dome(argc, argv),
+          closing(false),
+          opening(false),
           ticks(0)
+    {}
+
+    int initHardware() override
     {
-        logStream(MESSAGE_INFO)
-            << "RTS2 0.9.4 Virtual Dome started"
-            << sendLog;
-    }
-
-protected:
-    enum DomeState {
-        DS_CLOSED,
-        DS_OPEN,
-        DS_MOVING_OPEN,
-        DS_MOVING_CLOSE
-    };
-
-    DomeState domestate;
-    int ticks;
-
-    /* ---- centrald polls these ---- */
-
-    long isOpened() override
-    {
-        return domestate == DS_OPEN;
-    }
-
-    long isClosed() override
-    {
-        return domestate == DS_CLOSED;
-    }
-
-    /* ---- commands from centrald ---- */
-
-    int startOpen() override
-    {
-        logStream(MESSAGE_INFO) << "startOpen()" << sendLog;
-        domestate = DS_MOVING_OPEN;
+        logStream(MESSAGE_INFO) << "VirtualDome init: CLOSED" << sendLog;
+        closing = false;
+        opening = false;
         ticks = 0;
         return 0;
     }
@@ -52,42 +25,65 @@ protected:
     int startClose() override
     {
         logStream(MESSAGE_INFO) << "startClose()" << sendLog;
-        domestate = DS_MOVING_CLOSE;
+        closing = true;
+        opening = false;
         ticks = 0;
         return 0;
     }
 
-    int endOpen() override
+    int startOpen() override
     {
-        logStream(MESSAGE_INFO) << "endOpen()" << sendLog;
+        logStream(MESSAGE_INFO) << "startOpen()" << sendLog;
+        opening = true;
+        closing = false;
+        ticks = 0;
+        return 0;
+    }
+
+    long isClosed() override
+    {
+        if (!closing)
+            return -2;
+
+        if (++ticks > 3)
+        {
+            logStream(MESSAGE_INFO) << "VirtualDome: CLOSED" << sendLog;
+            closing = false;
+            return USEC_SEC;
+        }
+        return USEC_SEC;
+    }
+
+    long isOpened() override
+    {
+        if (!opening)
+            return 0;
+
+        if (++ticks > 3)
+        {
+            logStream(MESSAGE_INFO) << "VirtualDome: OPENED" << sendLog;
+            opening = false;
+            return 1;
+        }
         return 0;
     }
 
     int endClose() override
     {
-        logStream(MESSAGE_INFO) << "endClose()" << sendLog;
+        logStream(MESSAGE_DEBUG) << "endClose() (called by centrald)" << sendLog;
         return 0;
     }
 
-    /* ---- called periodically ---- */
-
-    int info() override
+    int endOpen() override
     {
-        if (domestate == DS_MOVING_OPEN && ++ticks >= 2)
-            domestate = DS_OPEN;
-
-        if (domestate == DS_MOVING_CLOSE && ++ticks >= 2)
-            domestate = DS_CLOSED;
-
+        logStream(MESSAGE_DEBUG) << "endOpen() (called by centrald)" << sendLog;
         return 0;
     }
 
-    int initHardware() override
-    {
-        domestate = DS_CLOSED;
-        ticks = 0;
-        return 0;
-    }
+private:
+    bool closing;
+    bool opening;
+    int ticks;
 };
 
 int main(int argc, char **argv)
