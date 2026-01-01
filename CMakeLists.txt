@@ -115,6 +115,24 @@ install(TARGETS rts2-teld-origin rts2-camd-origin
     RUNTIME DESTINATION /usr/local/bin
 )
 
+include_directories(/home/jonathan/src/rts2/include)
+
+add_executable(rts2-sensor-alwaysgood
+    rts2-sensor-alwaysgood.cpp
+)
+
+target_link_libraries(rts2-sensor-alwaysgood
+    ${RTS2_LIB}
+    pthread
+)
+
+add_executable(rts2-dome-virtual rts2-dome-virtual.cpp)
+target_include_directories(rts2-dome-virtual PRIVATE /home/jonathan/src/rts2/include)
+
+# Link to the same RTS2 core libs as your other daemons.
+# If your current daemons link just by librts2, reuse that.
+target_link_libraries(rts2-dome-virtual PRIVATE rts2 pthread)
+
 # Compiler flags
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")

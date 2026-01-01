@@ -24,6 +24,10 @@
 #include <string>
 #include <map>
 
+static inline double rad2deg(double r) { return r * 180.0 / M_PI; }
+static inline double deg2rad(double d) { return d * M_PI / 180.0; }
+static inline bool finite2(double a, double b) { return std::isfinite(a) && std::isfinite(b); }
+
 // Simple JSON parser for our needs
 class SimpleJSON {
 public:
@@ -149,6 +153,20 @@ Origin::~Origin()
     }
 }
 
+bool Origin::needInfo()
+{
+    // Force RTS2 to poll info() regularly
+    std::cout << "needInfo called";
+    return true;
+}
+
+bool Origin::isSafe()
+{
+    // Origin has its own safety logic; RTS2 should always poll us
+    std::cout << "isSafe called";
+    return true;
+}
+
 int Origin::processOption(int opt)
 {
     switch (opt)
@@ -223,9 +241,12 @@ int Origin::info()
     }
     
     // Update RTS2 with current position
+    std::cout << "RA: " << status->raPosition;
+    std::cout << "DEC: " << status->decPosition;
+
     if (status->lastUpdate > 0) {
-        setTelRa(status->raPosition);
-        setTelDec(status->decPosition);
+        if (std::isfinite(status->raPosition)) setTelRa(rad2deg(status->raPosition));
+        if (std::isfinite(status->decPosition)) setTelDec(rad2deg(status->decPosition));
         
         isAligned->setValueBool(status->isAligned);
         trackingEnabled->setValueBool(status->isTracking);
@@ -435,12 +456,6 @@ void Origin::updateTelescopeStatus(const std::string& jsonData)
     auto data = SimpleJSON::parse(jsonData);
     
     // Update status from JSON
-    if (data.find("Alt") != data.end()) {
-        status->altitude = std::stod(data["Alt"]);
-    }
-    if (data.find("Azm") != data.end()) {
-        status->azimuth = std::stod(data["Azm"]);
-    }
     if (data.find("IsAligned") != data.end()) {
         status->isAligned = (data["IsAligned"] == "true");
     }
@@ -453,12 +468,6 @@ void Origin::updateTelescopeStatus(const std::string& jsonData)
     if (data.find("BatteryVoltage") != data.end()) {
         status->batteryVoltage = std::stod(data["BatteryVoltage"]);
     }
-    
-    // Convert Alt/Az to RA/Dec
-    // This is a simplified conversion - in reality you'd need proper coordinate transformation
-    // For now, we'll use the mount's reported positions
-    status->raPosition = getTelRa();
-    status->decPosition = getTelDec();
     
     status->lastUpdate = time(nullptr);
 }

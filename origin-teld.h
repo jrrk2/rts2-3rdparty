@@ -40,6 +40,9 @@ class Origin : public Telescope
         virtual int setTo(double set_ra, double set_dec);
         virtual int correct(double cor_ra, double cor_dec, double real_ra, double real_dec);
         
+	virtual bool needInfo();
+	virtual bool isSafe();
+
     private:
         // Connection parameters
         std::string telescopeHost;
