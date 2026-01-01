@@ -1,0 +1,83 @@
+/*
+ * Celestron Origin Telescope Driver for RTS2
+ * 
+ * Direct Ethernet communication with Celestron Origin mount
+ */
+
+#ifndef __RTS2_ORIGIN_TELD_H__
+#define __RTS2_ORIGIN_TELD_H__
+
+#include "teld.h"
+#include "connection/fork.h"
+#include <string>
+#include <memory>
+
+// Forward declarations for Qt-free implementations
+class OriginWebSocket;
+struct TelescopeStatus;
+
+namespace rts2teld
+{
+
+class Origin : public Telescope
+{
+    public:
+        Origin(int argc, char **argv);
+        virtual ~Origin();
+
+    protected:
+        virtual int processOption(int opt);
+        virtual int initHardware();
+        virtual int info();
+        
+        virtual int startResync();
+        virtual int isMoving();
+        virtual int stopMove();
+        virtual int startPark();
+        virtual int endPark();
+        virtual int isParking();
+        
+        virtual int setTo(double set_ra, double set_dec);
+        virtual int correct(double cor_ra, double cor_dec, double real_ra, double real_dec);
+        
+    private:
+        // Connection parameters
+        std::string telescopeHost;
+        int telescopePort;
+        
+        // WebSocket connection
+        OriginWebSocket *webSocket;
+        bool connected;
+        
+        // Telescope status
+        TelescopeStatus *status;
+        int nextSequenceId;
+        
+        // Coordinate tracking
+        double targetRA;
+        double targetDec;
+        bool gotoInProgress;
+        
+        // Methods
+        bool connectToTelescope();
+        void disconnectFromTelescope();
+        bool sendCommand(const std::string& command, const std::string& destination,
+                        const std::string& params = "");
+        void processMessage(const std::string& message);
+        void updateTelescopeStatus(const std::string& jsonData);
+        
+        // Coordinate conversion
+        void j2000ToJNow(double ra_j2000, double dec_j2000, double *ra_jnow, double *dec_jnow);
+        void jnowToJ2000(double ra_jnow, double dec_jnow, double *ra_j2000, double *dec_j2000);
+        
+        // RTS2 values
+        rts2core::ValueString *telescopeAddress;
+        rts2core::ValueBool *isAligned;
+        rts2core::ValueBool *trackingEnabled;
+        rts2core::ValueDouble *batteryVoltage;
+        rts2core::ValueDouble *temperature;
+};
+
+}
+
+#endif // __RTS2_ORIGIN_TELD_H__
