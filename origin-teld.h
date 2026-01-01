@@ -44,6 +44,7 @@ class Origin : public Telescope
         // Connection parameters
         std::string telescopeHost;
         int telescopePort;
+        bool useDiscovery;  // NEW: Auto-discover telescope
         
         // WebSocket connection
         OriginWebSocket *webSocket;
@@ -65,6 +66,17 @@ class Origin : public Telescope
                         const std::string& params = "");
         void processMessage(const std::string& message);
         void updateTelescopeStatus(const std::string& jsonData);
+        
+        // Discovery
+        bool discoverTelescope();
+        bool startDiscovery();
+        void stopDiscovery();
+        void pollDiscovery();
+        
+        // Discovery state
+        int discoverySocket;
+        bool discovering;
+        time_t discoveryStartTime;
         
         // Coordinate conversion
         void j2000ToJNow(double ra_j2000, double dec_j2000, double *ra_jnow, double *dec_jnow);

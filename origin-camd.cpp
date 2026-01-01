@@ -13,6 +13,14 @@
 #include <curl/curl.h>
 #include <fitsio.h>
 
+// Network headers for discovery
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <algorithm>
+
 // Reuse the SimpleJSON class from telescope driver
 class SimpleJSON {
 public:
@@ -101,6 +109,7 @@ OriginCam::OriginCam(int argc, char **argv)
 {
     telescopeHost = "";
     telescopePort = 80;
+    useDiscovery = false;
     webSocket = nullptr;
     connected = false;
     cameraStatus = new CameraStatus();
@@ -116,6 +125,10 @@ OriginCam::OriginCam(int argc, char **argv)
     pendingImageRA = 0;
     pendingImageDec = 0;
     
+    discoverySocket = -1;
+    discovering = false;
+    discoveryStartTime = 0;
+    
     createValue(telescopeAddress, "telescope_address", "telescope IP address", false);
     telescopeAddress->setValueCharArr("");
     
@@ -128,12 +141,14 @@ OriginCam::OriginCam(int argc, char **argv)
     createValue(ccdTemp, "CCD_TEMP", "CCD temperature", false);
     ccdTemp->setValueDouble(20);
     
-    addOption('a', "address", 1, "telescope IP address (required)");
+    addOption('a', "address", 1, "telescope IP address (optional if using discovery)");
     addOption('p', "port", 1, "telescope port (default: 80)");
+    addOption('D', "discover", 0, "auto-discover telescope on network");
 }
 
 OriginCam::~OriginCam()
 {
+    stopDiscovery();
     disconnectFromTelescope();
     delete cameraStatus;
     if (webSocket) {
@@ -157,6 +172,10 @@ int OriginCam::processOption(int opt)
             telescopePort = atoi(optarg);
             return 0;
             
+        case 'D':
+            useDiscovery = true;
+            return 0;
+            
         default:
             return Camera::processOption(opt);
     }
@@ -164,8 +183,25 @@ int OriginCam::processOption(int opt)
 
 int OriginCam::initHardware()
 {
+    // If no address specified, use discovery
     if (telescopeHost.empty()) {
-        logStream(MESSAGE_ERROR) << "Telescope IP address not specified. Use -a option." << sendLog;
+        useDiscovery = true;
+    }
+    
+    if (useDiscovery) {
+        logStream(MESSAGE_INFO) << "Starting telescope discovery..." << sendLog;
+        
+        if (!discoverTelescope()) {
+            logStream(MESSAGE_ERROR) << "Failed to discover telescope. You can specify IP with -a option." << sendLog;
+            return -1;
+        }
+        
+        logStream(MESSAGE_INFO) << "Discovered telescope at " << telescopeHost << sendLog;
+        telescopeAddress->setValueCharArr(telescopeHost.c_str());
+    }
+    
+    if (telescopeHost.empty()) {
+        logStream(MESSAGE_ERROR) << "Telescope IP address not specified and discovery failed. Use -a option or -D for discovery." << sendLog;
         return -1;
     }
     
@@ -367,7 +403,7 @@ bool OriginCam::connectToTelescope()
     
     webSocket = new OriginWebSocket();
     
-    if (!webSocket->connect(telescopeHost, telescopePort, "/cgi-bin/AlpacaWebSocket")) {
+    if (!webSocket->connect(telescopeHost, telescopePort, "/SmartScope-1.0/mountControlEndpoint")) {
         logStream(MESSAGE_ERROR) << "WebSocket connection failed" << sendLog;
         delete webSocket;
         webSocket = nullptr;
@@ -518,6 +554,154 @@ bool OriginCam::downloadAndProcessImage(const std::string& filePath)
     logStream(MESSAGE_INFO) << "Downloaded " << imageData.size() << " bytes" << sendLog;
     
     return true;
+}
+
+// Discovery implementation (same as telescope driver)
+
+bool OriginCam::discoverTelescope()
+{
+    if (!startDiscovery()) {
+        return false;
+    }
+    
+    // Poll for up to 30 seconds
+    time_t startTime = time(nullptr);
+    while (time(nullptr) - startTime < 30) {
+        pollDiscovery();
+        
+        if (!telescopeHost.empty()) {
+            stopDiscovery();
+            return true;
+        }
+        
+        usleep(100000);  // 100ms
+    }
+    
+    stopDiscovery();
+    logStream(MESSAGE_ERROR) << "Discovery timeout after 30 seconds" << sendLog;
+    return false;
+}
+
+bool OriginCam::startDiscovery()
+{
+    logStream(MESSAGE_INFO) << "Starting UDP discovery on port 55555..." << sendLog;
+    
+    if (discoverySocket >= 0) {
+        close(discoverySocket);
+        discoverySocket = -1;
+    }
+    
+    discoverySocket = socket(AF_INET, SOCK_DGRAM, 0);
+    if (discoverySocket < 0) {
+        logStream(MESSAGE_ERROR) << "Failed to create UDP socket: " << strerror(errno) << sendLog;
+        return false;
+    }
+    
+    int flags = fcntl(discoverySocket, F_GETFL, 0);
+    fcntl(discoverySocket, F_SETFL, flags | O_NONBLOCK);
+    
+    int reuse = 1;
+    setsockopt(discoverySocket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#ifdef SO_REUSEPORT
+    setsockopt(discoverySocket, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+#endif
+    
+    int broadcast = 1;
+    setsockopt(discoverySocket, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+    
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(55555);
+    
+    if (bind(discoverySocket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        logStream(MESSAGE_ERROR) << "Failed to bind to port 55555: " << strerror(errno) << sendLog;
+        close(discoverySocket);
+        discoverySocket = -1;
+        return false;
+    }
+    
+    discovering = true;
+    discoveryStartTime = time(nullptr);
+    logStream(MESSAGE_INFO) << "Listening for telescope broadcasts..." << sendLog;
+    
+    return true;
+}
+
+void OriginCam::stopDiscovery()
+{
+    if (discoverySocket >= 0) {
+        close(discoverySocket);
+        discoverySocket = -1;
+    }
+    discovering = false;
+}
+
+void OriginCam::pollDiscovery()
+{
+    if (!discovering || discoverySocket < 0) {
+        return;
+    }
+    
+    char buffer[4096];
+    struct sockaddr_in sender_addr;
+    socklen_t sender_len = sizeof(sender_addr);
+    
+    while (discoverySocket >= 0) {
+        ssize_t bytesRead = recvfrom(discoverySocket, buffer, sizeof(buffer) - 1, 0,
+                                     (struct sockaddr*)&sender_addr, &sender_len);
+        
+        if (bytesRead < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            } else {
+                logStream(MESSAGE_ERROR) << "recvfrom error: " << strerror(errno) << sendLog;
+                break;
+            }
+        }
+        
+        if (bytesRead == 0) {
+            break;
+        }
+        
+        buffer[bytesRead] = '\0';
+        std::string datagram(buffer, bytesRead);
+        
+        char sender_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &sender_addr.sin_addr, sender_ip, INET_ADDRSTRLEN);
+        
+        if (datagram.find("Origin") != std::string::npos && 
+            datagram.find("IP Address") != std::string::npos) {
+            
+            std::string extractedIP;
+            size_t pos = 0;
+            while ((pos = datagram.find('.', pos)) != std::string::npos) {
+                size_t start = datagram.rfind(' ', pos);
+                if (start == std::string::npos) start = 0;
+                else start++;
+                
+                size_t end = datagram.find(' ', pos);
+                if (end == std::string::npos) end = datagram.length();
+                
+                std::string candidate = datagram.substr(start, end - start);
+                
+                if (std::count(candidate.begin(), candidate.end(), '.') == 3) {
+                    extractedIP = candidate;
+                    break;
+                }
+                pos++;
+            }
+            
+            if (extractedIP.empty()) {
+                extractedIP = sender_ip;
+            }
+            
+            logStream(MESSAGE_INFO) << "Discovered Celestron Origin at " << extractedIP << sendLog;
+            telescopeHost = extractedIP;
+            return;
+        }
+    }
 }
 
 // Main entry point

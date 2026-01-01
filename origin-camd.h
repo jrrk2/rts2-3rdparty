@@ -42,6 +42,7 @@ class OriginCam : public Camera
         // Connection parameters
         std::string telescopeHost;
         int telescopePort;
+        bool useDiscovery;  // NEW: Auto-discover telescope
         
         // WebSocket connection
         OriginWebSocket *webSocket;
@@ -73,6 +74,17 @@ class OriginCam : public Camera
         void updateCameraStatus(const std::string& jsonData);
         void handleImageReady(const std::string& filePath, double ra, double dec);
         bool downloadAndProcessImage(const std::string& filePath);
+        
+        // Discovery
+        bool discoverTelescope();
+        bool startDiscovery();
+        void stopDiscovery();
+        void pollDiscovery();
+        
+        // Discovery state
+        int discoverySocket;
+        bool discovering;
+        time_t discoveryStartTime;
         
         // RTS2 values
         rts2core::ValueString *telescopeAddress;
