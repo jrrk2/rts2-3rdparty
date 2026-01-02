@@ -1,90 +1,108 @@
-#include <dome.h>
-#include <unistd.h>
+/*
+ * RTS2 Virtual Dome Driver (RTS2 0.9.4)
+ *
+ * Minimal, correct dome simulator:
+ *  - No geometry
+ *  - No hardware
+ *  - No block manipulation
+ *  - Correct RTS2 state machine behaviour
+ *
+ * Tested logic against rts2/lib/rts2/dome.cpp
+ */
+
+#include "dome.h"
 
 using namespace rts2dome;
+using namespace rts2core;
 
 class VirtualDome : public Dome
 {
 public:
     VirtualDome(int argc, char **argv)
         : Dome(argc, argv),
-          closing(false),
-          opening(false),
-          ticks(0)
-    {}
-
-    int initHardware() override
+          state(CLOSED),
+          transition_end(0)
     {
         logStream(MESSAGE_INFO) << "VirtualDome init: CLOSED" << sendLog;
-        closing = false;
-        opening = false;
-        ticks = 0;
+    }
+
+protected:
+    enum DomeState {
+        OPEN,
+        CLOSED,
+        OPENING,
+        CLOSING
+    };
+
+    DomeState state;
+    double transition_end;
+
+    /* ---------- OPEN ---------- */
+
+    virtual int startOpen() override
+    {
+        logStream(MESSAGE_INFO) << "VirtualDome: startOpen()" << sendLog;
+        state = OPENING;
+        transition_end = getNow() + 5;   // 5s simulated motion
         return 0;
     }
 
-    int startClose() override
+    virtual long isOpened() override
     {
-        logStream(MESSAGE_INFO) << "startClose()" << sendLog;
-        closing = true;
-        opening = false;
-        ticks = 0;
-        return 0;
-    }
-
-    int startOpen() override
-    {
-        logStream(MESSAGE_INFO) << "startOpen()" << sendLog;
-        opening = true;
-        closing = false;
-        ticks = 0;
-        return 0;
-    }
-
-    long isClosed() override
-    {
-        if (!closing)
+        if (state == OPEN)
             return -2;
 
-        if (++ticks > 3)
-        {
-            logStream(MESSAGE_INFO) << "VirtualDome: CLOSED" << sendLog;
-            closing = false;
+        if (state == OPENING) {
+            if (getNow() >= transition_end) {
+                state = OPEN;
+                logStream(MESSAGE_INFO) << "VirtualDome: OPENED" << sendLog;
+                return -2;
+            }
             return USEC_SEC;
         }
-        return USEC_SEC;
+
+        return -1;
     }
 
-    long isOpened() override
+    virtual int endOpen() override
     {
-        if (!opening)
-            return 0;
+        return 0;
+    }
 
-        if (++ticks > 3)
-        {
-            logStream(MESSAGE_INFO) << "VirtualDome: OPENED" << sendLog;
-            opening = false;
-            return 1;
+    /* ---------- CLOSE ---------- */
+
+    virtual int startClose() override
+    {
+        logStream(MESSAGE_INFO) << "VirtualDome: startClose()" << sendLog;
+        state = CLOSING;
+        transition_end = getNow() + 5;   // 5s simulated motion
+        return 0;
+    }
+
+    virtual long isClosed() override
+    {
+        if (state == CLOSED)
+            return -2;
+
+        if (state == CLOSING) {
+            if (getNow() >= transition_end) {
+                state = CLOSED;
+                logStream(MESSAGE_INFO) << "VirtualDome: CLOSED" << sendLog;
+                return -2;
+            }
+            return USEC_SEC;
         }
-        return 0;
+
+        return -1;
     }
 
-    int endClose() override
+    virtual int endClose() override
     {
-        logStream(MESSAGE_DEBUG) << "endClose() (called by centrald)" << sendLog;
         return 0;
     }
-
-    int endOpen() override
-    {
-        logStream(MESSAGE_DEBUG) << "endOpen() (called by centrald)" << sendLog;
-        return 0;
-    }
-
-private:
-    bool closing;
-    bool opening;
-    int ticks;
 };
+
+/* ---------- MAIN ---------- */
 
 int main(int argc, char **argv)
 {
