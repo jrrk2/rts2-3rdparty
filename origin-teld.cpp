@@ -109,7 +109,7 @@ public:
 using namespace rts2teld;
 
 Origin::Origin(int argc, char **argv)
-    : Telescope(argc, argv)
+    : rts2teld::AltAz(argc, argv)
 {
     telescopeHost = "";
     telescopePort = 80;
@@ -118,8 +118,6 @@ Origin::Origin(int argc, char **argv)
     connected = false;
     status = new TelescopeStatus();
     nextSequenceId = 1;
-    targetRA = 0;
-    targetDec = 0;
     gotoInProgress = false;
     
     discoverySocket = -1;
@@ -144,6 +142,10 @@ Origin::Origin(int argc, char **argv)
     addOption('a', "address", 1, "telescope IP address (optional if using discovery)");
     addOption('p', "port", 1, "telescope port (default: 80)");
     addOption('D', "discover", 0, "auto-discover telescope on network");
+
+    alt_ticks->setValueLong(360 * 3600); // fake but non-zero
+    az_ticks->setValueLong(360 * 3600);
+
 }
 
 Origin::~Origin()
@@ -223,12 +225,22 @@ int Origin::initHardware()
     }
     
     // Set initial position (will be updated by status messages)
-    setTelRa(0);
-    setTelDec(0);
+    status->altitude = 45;
+    status->azimuth = 180.0;
     
     logStream(MESSAGE_INFO) << "Origin telescope initialized successfully" << sendLog;
     
     return 0;
+}
+
+void Origin::getTelAltAz(struct ln_hrz_posn *hrz)
+{
+    hrz->alt = rad2deg(status->altitude);
+    hrz->az  = rad2deg(status->azimuth);
+
+    // Also publish to RTS2 value system
+    telAltAz->setAlt(hrz->alt);
+    telAltAz->setAz(hrz->az);
 }
 
 int Origin::info()
@@ -245,11 +257,6 @@ int Origin::info()
     
     if (status->lastUpdate > 0) {
     // Update RTS2 with current position
-    std::cout << "RA: " << rad2hours(status->raPosition) << "DEC: " << rad2deg(status->decPosition) << "\n";
-
-        if (std::isfinite(status->raPosition)) setTelRa(rad2hours(status->raPosition));
-        if (std::isfinite(status->decPosition)) setTelDec(rad2deg(status->decPosition));
-        
         isAligned->setValueBool(status->isAligned);
         trackingEnabled->setValueBool(status->isTracking);
         batteryVoltage->setValueDouble(status->batteryVoltage);
@@ -394,7 +401,14 @@ bool Origin::connectToTelescope()
     sendCommand("GetStatus", "Mount");
     
     logStream(MESSAGE_INFO) << "Connected to telescope via WebSocket" << sendLog;
-    
+    setPointingModel(POINTING_ALTAZ);
+    // 2. Disable equatorial correction machinery
+    modelOff();
+    setCorrections(false, false, false, false);
+
+    // 3. Origin reports real angles, not encoder counts
+    // (prevents hrz2counts path)
+    setIgnoreCorrection(0);
     return true;
 }
 
@@ -496,23 +510,12 @@ void Origin::updateTelescopeStatus(const std::string& jsonData)
         return true;
     };
 
-    // These are present in your working Qt code:
-    //   Ra, Dec are radians (as sent by Origin)
-    //   Alt/Azm often radians too (depending on firmware; we’ll assume radians first)
-    double raRad = NAN, decRad = NAN;
-
-    if (getD("Ra", raRad)) {
-        status->raPosition = raRad;          // radians
-    }
-    if (getD("Dec", decRad)) {
-        status->decPosition = decRad;        // radians
-    }
-
-    // Optional: if your packets contain Alt/Azm and you want to sanity-check
     double altRad = NAN, azmRad = NAN;
     bool haveAlt = getD("Alt", altRad);
     bool haveAzm = getD("Azm", azmRad);
     if (haveAlt && haveAzm) {
+	status->altitude = altRad;
+	status->azimuth = azmRad;
         logStream(MESSAGE_INFO)
             << "Mount Alt/Azm (rad): " << altRad << " " << azmRad
             << "  (deg): " << rad2deg(altRad) << " " << rad2deg(azmRad)

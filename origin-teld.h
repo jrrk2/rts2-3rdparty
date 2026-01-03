@@ -8,6 +8,7 @@
 #define __RTS2_ORIGIN_TELD_H__
 
 #include "teld.h"
+#include "altaz.h"
 #include "connection/fork.h"
 #include <string>
 #include <memory>
@@ -19,7 +20,7 @@ struct TelescopeStatus;
 namespace rts2teld
 {
 
-class Origin : public Telescope
+class Origin : public rts2teld::AltAz
 {
     public:
         Origin(int argc, char **argv);
@@ -42,6 +43,7 @@ class Origin : public Telescope
         
 	virtual bool needInfo();
 	virtual bool isSafe();
+	virtual void getTelAltAz(struct ln_hrz_posn *hrz);
 
     private:
         // Connection parameters
