@@ -46,6 +46,7 @@ class Origin : public Telescope
         virtual int correct(double cor_ra, double cor_dec, double real_ra, double real_dec);
         
 	virtual bool isSafe();
+	virtual void valueChanged (rts2core::Value *changed_value) override;
 
     private:
         // Connection parameters

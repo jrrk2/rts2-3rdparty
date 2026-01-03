@@ -246,19 +246,42 @@ int Origin::info()
     return Telescope::info();
 }
 
+void Origin::valueChanged (rts2core::Value *changed_value)
+{
+    // Always let base class handle bookkeeping first
+    Telescope::valueChanged(changed_value);
+
+    if (changed_value == telTargetRaDec)
+    {
+        double ra  = telTargetRaDec->getRa();   // degrees
+        double dec = telTargetRaDec->getDec();  // degrees
+
+        logStream(MESSAGE_INFO)
+            << "tel_target manually updated: RA=" << ra
+            << " DEC=" << dec
+            << sendLog;
+
+        // Convert to radians for Origin
+        double ra_rad  = deg2rad(ra);
+        double dec_rad = deg2rad(dec);
+
+        // Send to Origin as a *sync*, not a goto
+        std::ostringstream params;
+        params << "{"
+               << "\"Ra\":"  << ra_rad << ","
+               << "\"Dec\":" << dec_rad
+               << "}";
+
+        sendCommand("GotoRaDec", "Mount", params.str());
+    }
+}
+
 int Origin::startResync()
 {
     // RTS2's Telescope class provides these public methods to get the target
     // The target is already stored when startResync() is called
-    double target_ra = getTargetRa();    // In hours
-    double target_dec = getTargetDec();   // In degrees
-    
-    // Convert J2000 coordinates to JNow for the mount
-    double ra_jnow, dec_jnow;
-    j2000ToJNow(target_ra, target_dec, &ra_jnow, &dec_jnow);
-    
-    targetRA = ra_jnow;
-    targetDec = dec_jnow;
+    double targetRa = getTargetRa();    // In hours
+    double targetDec = getTargetDec();   // In degrees
     
     // Build goto command
     std::ostringstream params;
