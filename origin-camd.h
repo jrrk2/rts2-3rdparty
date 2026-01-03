@@ -10,6 +10,7 @@
 #include "camd.h"
 #include <string>
 #include <memory>
+#include <tiffio.h>
 
 // Forward declarations
 class OriginWebSocket;
@@ -73,8 +74,9 @@ class OriginCam : public Camera
         void processMessage(const std::string& message);
         void updateCameraStatus(const std::string& jsonData);
         void handleImageReady(const std::string& filePath, double ra, double dec);
-        bool downloadAndProcessImage(const std::string& filePath);
-        
+        bool decodeTIFF(const std::vector<uint8_t> &imageData);
+        std::vector<uint8_t> downloadImageSync(const std::string &url);
+
         // Discovery
         bool discoverTelescope();
         bool startDiscovery();

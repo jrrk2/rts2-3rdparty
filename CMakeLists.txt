@@ -102,11 +102,14 @@ add_executable(rts2-camd-origin
     ${WEBSOCKET_SOURCES}
 )
 
+find_package(TIFF REQUIRED)
+
 target_link_libraries(rts2-camd-origin
     ${RTS2_LIB}
     ${OPENSSL_LIBRARIES}
     ${CURL_LIBRARIES}
     ${CFITSIO_LIB}
+    ${TIFF_LIBRARIES}
     pthread
 )
 

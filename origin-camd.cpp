@@ -10,7 +10,6 @@
 #include <cmath>
 #include <unistd.h>
 #include <sys/time.h>
-#include <curl/curl.h>
 #include <fitsio.h>
 
 // Network headers for discovery
@@ -92,15 +91,6 @@ public:
         return json.str();
     }
 };
-
-// CURL callback for downloading images
-static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp)
-{
-    size_t realsize = size * nmemb;
-    std::string *mem = (std::string *)userp;
-    mem->append((char *)contents, realsize);
-    return realsize;
-}
 
 using namespace rts2camd;
 
@@ -219,10 +209,9 @@ int OriginCam::initHardware()
 int OriginCam::initChips()
 {
     // Celestron Origin has a Sony IMX410 sensor
-    // 6072 x 4042 pixels, 5.9µm pixel size
-    int width = 6072;
-    int height = 4042;
-    float pixelSize = 5.9;
+    int width = 3056;
+    int height = 2048;
+    float pixelSize = 3.76;
     
     setSize(width, height, 0, 0);
     initBinnings();
@@ -350,32 +339,9 @@ long OriginCam::isExposing()
 
 int OriginCam::doReadout()
 {
-    if (!imageReady) {
-        logStream(MESSAGE_ERROR) << "No image ready for readout" << sendLog;
-        return -1;
-    }
-    
-    if (!imageBuffer || imageBufferSize == 0) {
-        logStream(MESSAGE_ERROR) << "No image data available" << sendLog;
-        return -1;
-    }
-    
-    // Copy image data to RTS2 buffer (chip 0)
-    int dataSize = getUsedWidth() * getUsedHeight() * sizeof(uint16_t);
-    
-    if ((size_t)dataSize > imageBufferSize) {
-        logStream(MESSAGE_ERROR) << "Image size mismatch" << sendLog;
-        return -1;
-    }
-    
-    memcpy(getDataBuffer(0), imageBuffer, dataSize);
-    
-    // Clear state
     exposureInProgress = false;
     imageReady = false;
-    
-    logStream(MESSAGE_INFO) << "Image readout complete" << sendLog;
-    
+
     return 0;
 }
 
@@ -497,62 +463,83 @@ void OriginCam::updateCameraStatus(const std::string& jsonData)
 void OriginCam::handleImageReady(const std::string& filePath, double ra, double dec)
 {
     pendingImagePath = filePath;
-    pendingImageRA = ra;
-    pendingImageDec = dec;
-    
+    pendingImageRA   = ra;
+    pendingImageDec  = dec;
+
     logStream(MESSAGE_INFO) << "Image ready: " << filePath << sendLog;
-    
-    // Download and process the image
-    if (downloadAndProcessImage(filePath)) {
+
+    std::string url =
+        "http://" + telescopeHost + "/SmartScope-1.0/dev2/" + filePath;
+
+    std::vector<uint8_t> imageData = downloadImageSync(url);
+
+    if (imageData.empty())
+    {
+        logStream(MESSAGE_ERROR) << "Image download failed" << sendLog;
+        exposureInProgress = false;
+        return;
+    }
+
+    if (decodeTIFF(imageData))
+    {
         imageReady = true;
-    } else {
-        logStream(MESSAGE_ERROR) << "Failed to download image" << sendLog;
+    }
+    else
+    {
+        logStream(MESSAGE_ERROR) << "TIFF decode failed" << sendLog;
         exposureInProgress = false;
     }
 }
 
-bool OriginCam::downloadAndProcessImage(const std::string& filePath)
+bool OriginCam::decodeTIFF(const std::vector<uint8_t> &imageData)
 {
-    // Construct URL
-    std::string url = "http://" + telescopeHost + filePath;
-    
-    // Use CURL to download
-    CURL *curl = curl_easy_init();
-    if (!curl) {
+    // Write to temp file (libtiff needs a filename)
+    std::string tmp = "/tmp/origin_image.tiff";
+    std::ofstream f(tmp, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(imageData.data()), imageData.size());
+    f.close();
+
+    TIFF *tif = TIFFOpen(tmp.c_str(), "r");
+    if (!tif)
+        return false;
+
+    uint32_t width, height;
+    uint16_t spp, bps, config;
+
+    TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &width);
+    TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &height);
+    TIFFGetField(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
+    TIFFGetField(tif, TIFFTAG_BITSPERSAMPLE, &bps);
+    TIFFGetField(tif, TIFFTAG_PLANARCONFIG, &config);
+
+    if (spp != 3 || bps != 16)
+    {
+        TIFFClose(tif);
         return false;
     }
-    
-    std::string imageData;
-    
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&imageData);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-    
-    CURLcode res = curl_easy_perform(curl);
-    curl_easy_cleanup(curl);
-    
-    if (res != CURLE_OK) {
-        logStream(MESSAGE_ERROR) << "CURL error: " << curl_easy_strerror(res) << sendLog;
-        return false;
-    }
-    
-    // Process FITS or TIFF image
-    // For now, assume it's FITS and copy the data
-    // In reality, you'd need to parse the FITS file properly
-    
-    if (imageBufferSize < imageData.size()) {
-        if (imageBuffer) {
-            delete[] imageBuffer;
+
+    size_t planeSize = width * height;
+
+    uint16_t *dst = reinterpret_cast<uint16_t *>(getDataBuffer(0));
+
+    std::vector<uint16_t> scanline(width * 3);
+
+    for (uint32 row = 0; row < height; row++)
+    {
+        TIFFReadScanline(tif, scanline.data(), row);
+
+        for (uint32 col = 0; col < width; col++)
+        {
+            size_t i = row * width + col;
+            size_t s = col * 3;
+
+            dst[i]                 = scanline[s + 0]; // R
+            dst[planeSize + i]     = scanline[s + 1]; // G
+            dst[planeSize*2 + i]   = scanline[s + 2]; // B
         }
-        imageBuffer = new unsigned char[imageData.size()];
-        imageBufferSize = imageData.size();
     }
-    
-    memcpy(imageBuffer, imageData.data(), imageData.size());
-    
-    logStream(MESSAGE_INFO) << "Downloaded " << imageData.size() << " bytes" << sendLog;
-    
+
+    TIFFClose(tif);
     return true;
 }
 
@@ -702,6 +689,188 @@ void OriginCam::pollDiscovery()
             return;
         }
     }
+}
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <cstring>
+#include <chrono>
+#include <thread>
+#include <vector>
+#include <string>
+#include <iostream>
+
+std::vector<uint8_t>
+OriginCam::downloadImageSync(const std::string &url)
+{
+    std::vector<uint8_t> result;
+
+    // ---- Parse URL (very simple HTTP only) ----
+    // expected: http://host[:port]/path
+    std::string proto = "http://";
+    if (url.rfind(proto, 0) != 0)
+    {
+        std::cerr << "Invalid URL (not http): " << url << std::endl;
+        return result;
+    }
+
+    std::string rest = url.substr(proto.size());
+    std::string host;
+    std::string path = "/";
+    int port = 80;
+
+    auto slashPos = rest.find('/');
+    if (slashPos != std::string::npos)
+    {
+        host = rest.substr(0, slashPos);
+        path = rest.substr(slashPos);
+    }
+    else
+    {
+        host = rest;
+    }
+
+    auto colonPos = host.find(':');
+    if (colonPos != std::string::npos)
+    {
+        port = std::stoi(host.substr(colonPos + 1));
+        host = host.substr(0, colonPos);
+    }
+
+    std::cerr << "Downloading from " << host
+              << ":" << port
+              << " path=" << path << std::endl;
+
+    // ---- Create socket ----
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0)
+    {
+        perror("socket");
+        return result;
+    }
+
+    // ---- Timeouts ----
+    struct timeval timeout;
+    timeout.tv_sec = 60;
+    timeout.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+    // ---- Resolve host ----
+    struct hostent *server = gethostbyname(host.c_str());
+    if (!server)
+    {
+        std::cerr << "gethostbyname failed for " << host << std::endl;
+        close(sock);
+        return result;
+    }
+
+    // ---- Connect ----
+    struct sockaddr_in serv_addr {};
+    serv_addr.sin_family = AF_INET;
+    std::memcpy(&serv_addr.sin_addr.s_addr,
+                server->h_addr,
+                server->h_length);
+    serv_addr.sin_port = htons(port);
+
+    if (connect(sock,
+                reinterpret_cast<struct sockaddr *>(&serv_addr),
+                sizeof(serv_addr)) < 0)
+    {
+        perror("connect");
+        close(sock);
+        return result;
+    }
+
+    // ---- Send GET ----
+    std::string request =
+        "GET " + path + " HTTP/1.1\r\n"
+        "Host: " + host + "\r\n"
+        "Connection: close\r\n\r\n";
+
+    if (send(sock, request.c_str(), request.size(), 0) < 0)
+    {
+        perror("send");
+        close(sock);
+        return result;
+    }
+
+    // ---- Read response ----
+    std::vector<uint8_t> response;
+    response.reserve(8 * 1024 * 1024);
+
+    char buffer[65536];
+    ssize_t n;
+    size_t totalBytes = 0;
+
+    auto lastKeepalive = std::chrono::steady_clock::now();
+    auto lastLog = lastKeepalive;
+
+    while (true)
+    {
+        n = recv(sock, buffer, sizeof(buffer), 0);
+        if (n > 0)
+        {
+            response.insert(response.end(), buffer, buffer + n);
+            totalBytes += n;
+        }
+        else if (n == 0)
+        {
+            break; // connection closed
+        }
+        else if (errno != EAGAIN && errno != EWOULDBLOCK)
+        {
+            perror("recv");
+            break;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+
+        // ---- WebSocket keepalive every 5s ----
+        if (std::chrono::duration_cast<std::chrono::seconds>(
+                now - lastKeepalive)
+                .count() >= 5)
+        {
+            lastKeepalive = now;
+        }
+
+        // ---- Progress log ----
+        if (std::chrono::duration_cast<std::chrono::seconds>(
+                now - lastLog)
+                .count() >= 5)
+        {
+            std::cerr << "Downloaded " << totalBytes << " bytes...\n";
+            lastLog = now;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    close(sock);
+
+    std::cerr << "Total received: " << response.size() << " bytes\n";
+
+    // ---- Strip HTTP headers ----
+    const std::string headerSep = "\r\n\r\n";
+    auto it = std::search(response.begin(), response.end(),
+                          headerSep.begin(), headerSep.end());
+
+    if (it == response.end())
+    {
+        std::cerr << "HTTP header not found\n";
+        return result;
+    }
+
+    it += headerSep.size();
+    result.assign(it, response.end());
+
+    std::cerr << "Image payload size: " << result.size() << " bytes\n";
+
+    return result;
 }
 
 // Main entry point
