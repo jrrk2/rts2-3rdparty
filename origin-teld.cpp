@@ -27,6 +27,8 @@
 
 static inline double rad2deg(double r) { return r * 180.0 / M_PI; }
 static inline double deg2rad(double d) { return d * M_PI / 180.0; }
+static inline double rad2hours(double r) { return r * 12.0 / M_PI; }
+
 static inline bool finite2(double a, double b) { return std::isfinite(a) && std::isfinite(b); }
 
 // Simple JSON parser for our needs
@@ -241,35 +243,11 @@ int Origin::info()
         }
     }
     
-    // Update RTS2 with current position
-    std::cout << "RA: " << status->raPosition;
-    std::cout << "DEC: " << status->decPosition;
-
-    if (std::isfinite(status->altitude) && std::isfinite(status->azimuth)) {
-
-    ln_lnlat_posn obs;
-    obs.lat = getLatitude();
-    obs.lng = getLongitude();
-
-    ln_hrz_posn hrz;
-    hrz.alt = status->altitude;
-    hrz.az  = status->azimuth;
-
-    ln_equ_posn equ;
-    double jd = ln_get_julian_from_sys();
-
-    ln_get_equ_from_hrz(&hrz, &obs, jd, &equ);
-
-    // equ.ra is in DEGREES
-    double ra_hours = equ.ra / 15.0;
-    double dec_deg  = equ.dec;
-
-    setTelRa(ra_hours);
-    setTelDec(dec_deg);
-}
-
     if (status->lastUpdate > 0) {
-        if (std::isfinite(status->raPosition)) setTelRa(rad2deg(status->raPosition));
+    // Update RTS2 with current position
+    std::cout << "RA: " << rad2hours(status->raPosition) << "DEC: " << rad2deg(status->decPosition) << "\n";
+
+        if (std::isfinite(status->raPosition)) setTelRa(rad2hours(status->raPosition));
         if (std::isfinite(status->decPosition)) setTelDec(rad2deg(status->decPosition));
         
         isAligned->setValueBool(status->isAligned);
