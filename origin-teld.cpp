@@ -109,7 +109,7 @@ public:
 using namespace rts2teld;
 
 Origin::Origin(int argc, char **argv)
-    : rts2teld::AltAz(argc, argv)
+    : Telescope(argc, argv)
 {
     telescopeHost = "";
     telescopePort = 80;
@@ -143,9 +143,6 @@ Origin::Origin(int argc, char **argv)
     addOption('p', "port", 1, "telescope port (default: 80)");
     addOption('D', "discover", 0, "auto-discover telescope on network");
 
-    alt_ticks->setValueLong(360 * 3600); // fake but non-zero
-    az_ticks->setValueLong(360 * 3600);
-
 }
 
 Origin::~Origin()
@@ -161,7 +158,6 @@ Origin::~Origin()
 bool Origin::needInfo()
 {
     // Force RTS2 to poll info() regularly
-    std::cout << "needInfo called";
     return true;
 }
 
@@ -225,43 +221,28 @@ int Origin::initHardware()
     }
     
     // Set initial position (will be updated by status messages)
-    status->altitude = 45;
-    status->azimuth = 180.0;
-    
+    status->altitude = deg2rad(45.0);
+    status->azimuth = deg2rad(180.0);
+    setTelRaDec(0.0, 90.0);
+    startTracking(true);
+
     logStream(MESSAGE_INFO) << "Origin telescope initialized successfully" << sendLog;
     
     return 0;
 }
 
-void Origin::getTelAltAz(struct ln_hrz_posn *hrz)
-{
-    hrz->alt = rad2deg(status->altitude);
-    hrz->az  = rad2deg(status->azimuth);
-
-    // Also publish to RTS2 value system
-    telAltAz->setAlt(hrz->alt);
-    telAltAz->setAz(hrz->az);
-}
-
 int Origin::info()
 {
-    // Poll for new messages
-    if (webSocket && webSocket->isConnected()) {
-        while (webSocket->hasData()) {
-            std::string message = webSocket->receiveText();
-            if (!message.empty()) {
-                processMessage(message);
-            }
-        }
-    }
-    
+    if (!siteLocationSet)
+        return 0;
+
     if (status->lastUpdate > 0) {
     // Update RTS2 with current position
         isAligned->setValueBool(status->isAligned);
         trackingEnabled->setValueBool(status->isTracking);
         batteryVoltage->setValueDouble(status->batteryVoltage);
     }
-    
+
     return Telescope::info();
 }
 
@@ -401,19 +382,36 @@ bool Origin::connectToTelescope()
     sendCommand("GetStatus", "Mount");
     
     logStream(MESSAGE_INFO) << "Connected to telescope via WebSocket" << sendLog;
-    setPointingModel(POINTING_ALTAZ);
-    // 2. Disable equatorial correction machinery
-    modelOff();
-    setCorrections(false, false, false, false);
-
-    // 3. Origin reports real angles, not encoder counts
-    // (prevents hrz2counts path)
-    setIgnoreCorrection(0);
+    keepaliveRunning = true;
+keepaliveThread = std::thread([this]() {
+    while (keepaliveRunning) {
+        if (webSocket && webSocket->isConnected()) {
+            sendCommand("GetStatus", "Mount");
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+});
+rxRunning = true;
+rxThread = std::thread([this]() {
+    while (rxRunning) {
+        if (webSocket && webSocket->isConnected()) {
+	while (webSocket->hasData()) {
+    processMessage(webSocket->receiveText());
+}
+std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+});
     return true;
 }
 
 void Origin::disconnectFromTelescope()
 {
+    keepaliveRunning = false;
+    if (keepaliveThread.joinable())
+        keepaliveThread.join();
     if (webSocket) {
         webSocket->disconnect();
         delete webSocket;
@@ -455,7 +453,7 @@ bool Origin::sendCommand(const std::string& command,
     }
 
     // Log what we send (temporarily)
-    logStream(MESSAGE_INFO) << "WS SEND: " << message << sendLog;
+    if (false) logStream(MESSAGE_INFO) << "WS SEND: " << message << sendLog;
 
     return webSocket->sendText(message);
 }
@@ -471,7 +469,7 @@ void Origin::processMessage(const std::string& message)
     // TEMP: dump everything from Mount so we can see what arrives
     if (source == "Mount")
     {
-        logStream(MESSAGE_INFO) << "WS RECV (Mount) raw=" << message << sendLog;
+        if (false) logStream(MESSAGE_INFO) << "WS RECV (Mount) raw=" << message << sendLog;
         updateTelescopeStatus(message);
         return;
     }
@@ -485,7 +483,7 @@ void Origin::updateTelescopeStatus(const std::string& jsonData)
     auto data = SimpleJSON::parse(jsonData);
 
     // 1) TEMP: log all keys we parsed (so you can see what Origin is *actually* sending)
-    {
+    if (false) {
         std::ostringstream oss;
         oss << "Mount keys:";
         for (const auto& kv : data)
@@ -516,11 +514,47 @@ void Origin::updateTelescopeStatus(const std::string& jsonData)
     if (haveAlt && haveAzm) {
 	status->altitude = altRad;
 	status->azimuth = azmRad;
-        logStream(MESSAGE_INFO)
+        if (false) logStream(MESSAGE_INFO)
             << "Mount Alt/Azm (rad): " << altRad << " " << azmRad
             << "  (deg): " << rad2deg(altRad) << " " << rad2deg(azmRad)
             << sendLog;
     }
+
+    double raRad = NAN, decRad = NAN;
+    bool haveRa = getD("Ra", raRad);
+    bool haveDec = getD("Dec", decRad);
+    if (haveRa && haveDec) {
+        status->raPosition = raRad;
+        status->decPosition = decRad;
+	double ra_deg = rad2deg(raRad);
+	double dec_deg = rad2deg(decRad);
+	setTelRaDec(ra_deg / 15.0, dec_deg);
+        if (!raDecSet) logStream(MESSAGE_INFO)
+            << "Mount Ra/Dec (rad): " << raRad << " " << decRad
+            << "  (deg): " << ra_deg << " " << dec_deg
+            << sendLog;
+	raDecSet = true;
+    }
+
+    double latRad, lonRad;
+
+bool haveLat = getD("Latitude", latRad);
+bool haveLon = getD("Longitude", lonRad);
+
+if (haveLat && haveLon && !siteLocationSet) {
+    double latDeg = rad2deg(latRad);
+    double lonDeg = rad2deg(lonRad);
+
+    setTelLongLat(lonDeg, latDeg);
+    setTelAltitude(50.0);   // metres, fine
+
+    siteLocationSet = true;
+
+    logStream(MESSAGE_INFO)
+        << "Site location set: lat=" << latDeg
+        << " lon=" << lonDeg
+        << sendLog;
+}
 
     // Flags/status
     if (data.find("IsAligned") != data.end())

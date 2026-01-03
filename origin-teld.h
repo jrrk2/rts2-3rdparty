@@ -12,6 +12,8 @@
 #include "connection/fork.h"
 #include <string>
 #include <memory>
+#include <thread>
+#include <atomic>
 
 // Forward declarations for Qt-free implementations
 class OriginWebSocket;
@@ -20,7 +22,7 @@ struct TelescopeStatus;
 namespace rts2teld
 {
 
-class Origin : public rts2teld::AltAz
+class Origin : public Telescope
 {
     public:
         Origin(int argc, char **argv);
@@ -30,6 +32,8 @@ class Origin : public rts2teld::AltAz
         virtual int processOption(int opt);
         virtual int initHardware();
         virtual int info();
+
+        virtual bool needInfo();
         
         virtual int startResync();
         virtual int isMoving();
@@ -41,9 +45,7 @@ class Origin : public rts2teld::AltAz
         virtual int setTo(double set_ra, double set_dec);
         virtual int correct(double cor_ra, double cor_dec, double real_ra, double real_dec);
         
-	virtual bool needInfo();
 	virtual bool isSafe();
-	virtual void getTelAltAz(struct ln_hrz_posn *hrz);
 
     private:
         // Connection parameters
@@ -93,6 +95,12 @@ class Origin : public rts2teld::AltAz
         rts2core::ValueBool *trackingEnabled;
         rts2core::ValueDouble *batteryVoltage;
         rts2core::ValueDouble *temperature;
+	std::thread keepaliveThread;
+	std::atomic<bool> keepaliveRunning{false};
+	std::thread rxThread;
+	std::atomic<bool> rxRunning{false};
+	bool siteLocationSet = false;
+	bool raDecSet = false;
 };
 
 }
