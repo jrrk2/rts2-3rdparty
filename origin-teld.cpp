@@ -413,7 +413,7 @@ bool Origin::connectToTelescope()
     connected = true;
     
     // Send initial status request
-    sendCommand("GetMountStatus", "Mount");
+    sendCommand("GetStatus", "Mount");
     
     logStream(MESSAGE_INFO) << "Connected to telescope via WebSocket" << sendLog;
     
@@ -430,87 +430,132 @@ void Origin::disconnectFromTelescope()
     connected = false;
 }
 
-bool Origin::sendCommand(const std::string& command, const std::string& destination,
+bool Origin::sendCommand(const std::string& command,
+                         const std::string& destination,
                          const std::string& params)
 {
-    if (!webSocket || !webSocket->isConnected()) {
+    if (!webSocket || !webSocket->isConnected())
         return false;
-    }
-    
+
     std::map<std::string, std::string> cmdData;
-    cmdData["Sequence"] = std::to_string(nextSequenceId++);
-    cmdData["Source"] = "INDI";
+    cmdData["Command"]     = command;
     cmdData["Destination"] = destination;
-    cmdData["Command"] = command;
-    cmdData["Type"] = "Command";
-    
+    cmdData["SequenceID"]  = std::to_string(nextSequenceId++);   // <-- IMPORTANT
+    cmdData["Source"]      = "RTS2";                              // keep simple
+    cmdData["Type"]        = "Command";
+
     std::string message = SimpleJSON::create(cmdData);
-    
-    // If we have params, we need to merge them
-    if (!params.empty()) {
-        // Remove trailing }
-        message = message.substr(0, message.length() - 1);
-        // Add params (remove leading {)
-        message += "," + params.substr(1);
+
+    // Merge params object fields into the top-level JSON object (your old approach)
+    if (!params.empty())
+    {
+        // message ends with "}"
+        if (!message.empty() && message.back() == '}')
+            message.pop_back();
+
+        // params begins with "{"
+        std::string p = params;
+        if (!p.empty() && p.front() == '{')
+            p.erase(p.begin());
+
+        message += ",";
+        message += p; // now ends with "}"
     }
-    
+
+    // Log what we send (temporarily)
+    logStream(MESSAGE_INFO) << "WS SEND: " << message << sendLog;
+
     return webSocket->sendText(message);
 }
 
 void Origin::processMessage(const std::string& message)
 {
     auto data = SimpleJSON::parse(message);
-    
-    std::string source = data["Source"];
-    std::string command = data["Command"];
-    std::string type = data["Type"];
-    
-    // Only process notifications and responses
-    if (type != "Notification" && type != "Response") {
+
+    const std::string source  = (data.count("Source")  ? data["Source"]  : "");
+    const std::string command = (data.count("Command") ? data["Command"] : "");
+    const std::string type    = (data.count("Type")    ? data["Type"]    : "");
+
+    // TEMP: dump everything from Mount so we can see what arrives
+    if (source == "Mount")
+    {
+        logStream(MESSAGE_INFO) << "WS RECV (Mount) raw=" << message << sendLog;
+        updateTelescopeStatus(message);
         return;
     }
-    
-    if (source == "Mount") {
-        updateTelescopeStatus(message);
-    }
+
+    // Keep other sources if you want later
+    // if (source == "Environment") ...
 }
 
 void Origin::updateTelescopeStatus(const std::string& jsonData)
 {
     auto data = SimpleJSON::parse(jsonData);
-    
-    // 🔍 DEBUG: dump all Mount fields
-    logStream(MESSAGE_INFO) << "---- Mount JSON ----" << sendLog;
-    for (const auto &kv : data) {
+
+    // 1) TEMP: log all keys we parsed (so you can see what Origin is *actually* sending)
+    {
+        std::ostringstream oss;
+        oss << "Mount keys:";
+        for (const auto& kv : data)
+            oss << " " << kv.first << "=" << kv.second;
+        logStream(MESSAGE_INFO) << oss.str() << sendLog;
+    }
+
+    // 2) Parse the fields we care about
+    auto getD = [&](const char* k, double& out) -> bool {
+        auto it = data.find(k);
+        if (it == data.end()) return false;
+        try {
+            out = std::stod(it->second);
+            return std::isfinite(out);
+        } catch (...) { return false; }
+    };
+
+    auto getB = [&](const char* k, bool& out) -> bool {
+        auto it = data.find(k);
+        if (it == data.end()) return false;
+        out = (it->second == "true" || it->second == "1");
+        return true;
+    };
+
+    // These are present in your working Qt code:
+    //   Ra, Dec are radians (as sent by Origin)
+    //   Alt/Azm often radians too (depending on firmware; we’ll assume radians first)
+    double raRad = NAN, decRad = NAN;
+
+    if (getD("Ra", raRad)) {
+        status->raPosition = raRad;          // radians
+    }
+    if (getD("Dec", decRad)) {
+        status->decPosition = decRad;        // radians
+    }
+
+    // Optional: if your packets contain Alt/Azm and you want to sanity-check
+    double altRad = NAN, azmRad = NAN;
+    bool haveAlt = getD("Alt", altRad);
+    bool haveAzm = getD("Azm", azmRad);
+    if (haveAlt && haveAzm) {
         logStream(MESSAGE_INFO)
-            << kv.first << " = " << kv.second
+            << "Mount Alt/Azm (rad): " << altRad << " " << azmRad
+            << "  (deg): " << rad2deg(altRad) << " " << rad2deg(azmRad)
             << sendLog;
     }
-    logStream(MESSAGE_INFO) << "--------------------" << sendLog;
 
-    if (data.count("Alt")) {
-    status->altitude = std::stod(data["Alt"]);   // degrees
-    std::cout << "Altitude: " << status->altitude ;
-}
-if (data.count("Azm")) {
-    status->azimuth = std::stod(data["Azm"]);    // degrees
-    std::cout << "Azimuth: " << status->azimuth ;
-}
-
-    // Update status from JSON
-    if (data.find("IsAligned") != data.end()) {
+    // Flags/status
+    if (data.find("IsAligned") != data.end())
         status->isAligned = (data["IsAligned"] == "true");
-    }
-    if (data.find("IsTracking") != data.end()) {
+
+    if (data.find("IsTracking") != data.end())
         status->isTracking = (data["IsTracking"] == "true");
-    }
-    if (data.find("IsGotoOver") != data.end()) {
+
+    if (data.find("IsGotoOver") != data.end())
         status->isSlewing = (data["IsGotoOver"] == "false");
-    }
+
     if (data.find("BatteryVoltage") != data.end()) {
-        status->batteryVoltage = std::stod(data["BatteryVoltage"]);
+        try { status->batteryVoltage = std::stod(data["BatteryVoltage"]); }
+        catch (...) {}
     }
-    
+
     status->lastUpdate = time(nullptr);
 }
 
