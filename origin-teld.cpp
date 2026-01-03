@@ -6,6 +6,7 @@
 #include "origin-websocket.h"
 #include "origin-data.h"
 #include <libnova/precession.h>
+#include <libnova/transform.h>
 #include <libnova/julian_day.h>
 #include <sstream>
 #include <cstring>
@@ -244,6 +245,29 @@ int Origin::info()
     std::cout << "RA: " << status->raPosition;
     std::cout << "DEC: " << status->decPosition;
 
+    if (std::isfinite(status->altitude) && std::isfinite(status->azimuth)) {
+
+    ln_lnlat_posn obs;
+    obs.lat = getLatitude();
+    obs.lng = getLongitude();
+
+    ln_hrz_posn hrz;
+    hrz.alt = status->altitude;
+    hrz.az  = status->azimuth;
+
+    ln_equ_posn equ;
+    double jd = ln_get_julian_from_sys();
+
+    ln_get_equ_from_hrz(&hrz, &obs, jd, &equ);
+
+    // equ.ra is in DEGREES
+    double ra_hours = equ.ra / 15.0;
+    double dec_deg  = equ.dec;
+
+    setTelRa(ra_hours);
+    setTelDec(dec_deg);
+}
+
     if (status->lastUpdate > 0) {
         if (std::isfinite(status->raPosition)) setTelRa(rad2deg(status->raPosition));
         if (std::isfinite(status->decPosition)) setTelDec(rad2deg(status->decPosition));
@@ -455,6 +479,24 @@ void Origin::updateTelescopeStatus(const std::string& jsonData)
 {
     auto data = SimpleJSON::parse(jsonData);
     
+    // 🔍 DEBUG: dump all Mount fields
+    logStream(MESSAGE_INFO) << "---- Mount JSON ----" << sendLog;
+    for (const auto &kv : data) {
+        logStream(MESSAGE_INFO)
+            << kv.first << " = " << kv.second
+            << sendLog;
+    }
+    logStream(MESSAGE_INFO) << "--------------------" << sendLog;
+
+    if (data.count("Alt")) {
+    status->altitude = std::stod(data["Alt"]);   // degrees
+    std::cout << "Altitude: " << status->altitude ;
+}
+if (data.count("Azm")) {
+    status->azimuth = std::stod(data["Azm"]);    // degrees
+    std::cout << "Azimuth: " << status->azimuth ;
+}
+
     // Update status from JSON
     if (data.find("IsAligned") != data.end()) {
         status->isAligned = (data["IsAligned"] == "true");

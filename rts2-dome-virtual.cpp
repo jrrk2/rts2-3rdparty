@@ -66,6 +66,11 @@ protected:
 
     virtual int endOpen() override
     {
+        maskState(
+            DOME_DOME_MASK | DEVICE_BLOCK_OPEN | DEVICE_BLOCK_CLOSE,
+            DOME_OPENED | DEVICE_BLOCK_CLOSE,
+            "virtual dome opened");
+
         return 0;
     }
 
@@ -98,6 +103,11 @@ protected:
 
     virtual int endClose() override
     {
+	maskState(
+            DOME_DOME_MASK | DEVICE_BLOCK_OPEN | DEVICE_BLOCK_CLOSE,
+            DOME_CLOSED | DEVICE_BLOCK_OPEN,
+            "virtual dome closed");
+
         return 0;
     }
 };
