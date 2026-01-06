@@ -11,6 +11,8 @@
 #include <string>
 #include <memory>
 #include <tiffio.h>
+#include <thread>
+#include <atomic>
 
 // Forward declarations
 class OriginWebSocket;
@@ -38,8 +40,13 @@ class OriginCam : public Camera
         
         virtual int setCoolTemp(float new_temp);
         virtual int switchCooling(bool cooling);
-        
+	int commandAuthorized(rts2core::Connection *conn) override;
+
     private:
+    	std::thread pollThread;
+    	std::atomic<bool> pollRunning;
+    	void pollLoop();
+
         // Connection parameters
         std::string telescopeHost;
         int telescopePort;
@@ -93,6 +100,8 @@ class OriginCam : public Camera
         rts2core::ValueInteger *gain;
         rts2core::ValueBool *previewMode;
         rts2core::ValueDouble *ccdTemp;
+	// status
+	bool oldconn;
 };
 
 }

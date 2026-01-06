@@ -123,7 +123,7 @@ OriginCam::OriginCam(int argc, char **argv)
     telescopeAddress->setValueCharArr("");
     
     createValue(gain, "GAIN", "camera ISO/gain", true, RTS2_VALUE_WRITABLE);
-    gain->setValueInteger(800);
+    gain->setValueInteger(100);
     
     createValue(previewMode, "PREVIEW", "preview mode (faster downloads)", true, RTS2_VALUE_WRITABLE);
     previewMode->setValueBool(false);
@@ -134,6 +134,8 @@ OriginCam::OriginCam(int argc, char **argv)
     addOption('a', "address", 1, "telescope IP address (optional if using discovery)");
     addOption('p', "port", 1, "telescope port (default: 80)");
     addOption('D', "discover", 0, "auto-discover telescope on network");
+
+    setDeviceName("ORIGIN_CAM");
 }
 
 OriginCam::~OriginCam()
@@ -203,6 +205,7 @@ int OriginCam::initHardware()
     
     logStream(MESSAGE_INFO) << "Origin camera initialized successfully" << sendLog;
     
+    initChips();
     return 0;
 }
 
@@ -213,7 +216,7 @@ int OriginCam::initChips()
     int height = 2048;
     float pixelSize = 3.76;
     
-    setSize(width, height, 0, 0);
+    initCameraChip (width, height, pixelSize, pixelSize);
     initBinnings();
     
     logStream(MESSAGE_INFO) << "Chip initialized: " << width << "x" << height 
@@ -222,18 +225,27 @@ int OriginCam::initChips()
     return 0;
 }
 
-int OriginCam::info()
+void OriginCam::pollLoop()
 {
-    // Poll for new messages
-    if (webSocket && webSocket->isConnected()) {
-        while (webSocket->hasData()) {
-            std::string message = webSocket->receiveText();
-            if (!message.empty()) {
-                processMessage(message);
+    while (pollRunning)
+    {
+        if (webSocket && webSocket->isConnected())
+        {
+            while (webSocket->hasData())
+            {
+                std::string msg = webSocket->receiveText();
+                if (!msg.empty())
+                    processMessage(msg);
             }
         }
+
+        // Small sleep to avoid burning CPU
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
-    
+}
+
+int OriginCam::info()
+{
     // Update temperature
     if (cameraStatus->lastUpdate > 0) {
         ccdTemp->setValueDouble(cameraStatus->temperature);
@@ -382,7 +394,8 @@ bool OriginCam::connectToTelescope()
     sendCommand("GetCaptureParameters", "Camera");
     
     logStream(MESSAGE_INFO) << "Connected to camera via WebSocket" << sendLog;
-    
+    pollRunning = true;
+    pollThread = std::thread(&OriginCam::pollLoop, this);
     return true;
 }
 
@@ -393,6 +406,9 @@ void OriginCam::disconnectFromTelescope()
         delete webSocket;
         webSocket = nullptr;
     }
+    pollRunning = false;
+    if (pollThread.joinable())
+        pollThread.join();
     connected = false;
 }
 
@@ -460,13 +476,18 @@ void OriginCam::updateCameraStatus(const std::string& jsonData)
     cameraStatus->lastUpdate = time(nullptr);
 }
 
+static bool isJPEG(const std::vector<uint8_t>& data)
+{
+    return data.size() > 2 && data[0] == 0xFF && data[1] == 0xD8;
+}
+
 void OriginCam::handleImageReady(const std::string& filePath, double ra, double dec)
 {
     pendingImagePath = filePath;
     pendingImageRA   = ra;
     pendingImageDec  = dec;
 
-    logStream(MESSAGE_INFO) << "Image ready: " << filePath << sendLog;
+    if (false) logStream(MESSAGE_INFO) << "Image ready: " << filePath << sendLog;
 
     std::string url =
         "http://" + telescopeHost + "/SmartScope-1.0/dev2/" + filePath;
@@ -480,7 +501,22 @@ void OriginCam::handleImageReady(const std::string& filePath, double ra, double 
         return;
     }
 
-    if (decodeTIFF(imageData))
+    if (isJPEG(imageData))
+    {
+    // Write to temp file (libtiff needs a filename)
+    std::string tmp = "/tmp" + (std::string)(strrchr(filePath.c_str(), '/'));
+    std::ofstream f(tmp, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(imageData.data()), imageData.size());
+    f.close();
+    if (false) logStream(MESSAGE_INFO)
+        << "JPEG " << tmp << " received (" << imageData.size() << " bytes), ignoring"
+        << sendLog;
+
+    // Mark exposure complete so RTS2 doesn’t hang
+    imageReady = true;
+    exposureInProgress = false;
+    }
+    else if (decodeTIFF(imageData))
     {
         imageReady = true;
     }
@@ -524,11 +560,11 @@ bool OriginCam::decodeTIFF(const std::vector<uint8_t> &imageData)
 
     std::vector<uint16_t> scanline(width * 3);
 
-    for (uint32 row = 0; row < height; row++)
+    for (uint32_t row = 0; row < height; row++)
     {
         TIFFReadScanline(tif, scanline.data(), row);
 
-        for (uint32 col = 0; col < width; col++)
+        for (uint32_t  col = 0; col < width; col++)
         {
             size_t i = row * width + col;
             size_t s = col * 3;
@@ -540,6 +576,8 @@ bool OriginCam::decodeTIFF(const std::vector<uint8_t> &imageData)
     }
 
     TIFFClose(tif);
+    sendImage((char *)dst, planeSize*3*sizeof(uint16_t));
+    endReadout();
     return true;
 }
 
@@ -741,7 +779,7 @@ OriginCam::downloadImageSync(const std::string &url)
         host = host.substr(0, colonPos);
     }
 
-    std::cerr << "Downloading from " << host
+    if (false) std::cerr << "Downloading from " << host
               << ":" << port
               << " path=" << path << std::endl;
 
@@ -852,7 +890,7 @@ OriginCam::downloadImageSync(const std::string &url)
 
     close(sock);
 
-    std::cerr << "Total received: " << response.size() << " bytes\n";
+    if (false) std::cerr << "Total received: " << response.size() << " bytes\n";
 
     // ---- Strip HTTP headers ----
     const std::string headerSep = "\r\n\r\n";
@@ -868,9 +906,29 @@ OriginCam::downloadImageSync(const std::string &url)
     it += headerSep.size();
     result.assign(it, response.end());
 
-    std::cerr << "Image payload size: " << result.size() << " bytes\n";
+    if (false) std::cerr << "Image payload size: " << result.size() << " bytes\n";
 
     return result;
+}
+
+int OriginCam::commandAuthorized(rts2core::Connection *conn)
+{
+    if (conn->isCommand("getCommand"))
+    {
+        char *cmd;
+        if (conn->paramNextString(&cmd) || !conn->paramEnd())
+            return -2;
+
+        if (!strcmp(cmd, "expose"))
+            return 0;   // YES, supported
+
+        if (!strcmp(cmd, "stopexpo"))
+            return 0;
+
+        return -1;      // unknown command
+    }
+
+    return Camera::commandAuthorized(conn);
 }
 
 // Main entry point
