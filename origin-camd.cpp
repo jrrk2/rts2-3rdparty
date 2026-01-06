@@ -477,10 +477,6 @@ int OriginCam::stopExposure()
     return 0;
 }
 
-// --- REPLACE OriginCam::isExposing() ---
-// Fixes:
-//  - NEVER return -2 until snapshotReady == true (prevents RTS2 "cannot exposure on chip" poison path)
-//  - After exposure time elapsed, keep returning small wait until TIFF arrives
 long OriginCam::isExposing()
 {
     // If we are not in an exposure cycle, RTS2 expects -2 (idle)
@@ -488,16 +484,16 @@ long OriginCam::isExposing()
         return -2;
     }
 
-    // If TIFF is latched, signal completion to RTS2 (it will call doReadout next)
+    // If TIFF is latched, signal completion to RTS2
     {
         std::lock_guard<std::mutex> lock(snapshotMutex);
         if (snapshotReady) {
             VLOG(MESSAGE_DEBUG) << "isExposing(): snapshotReady -> returning -2" << sendLog;
-            return -2;
+            return -2;  // This is correct - tells RTS2 to call doReadout()
         }
     }
 
-    // Otherwise report remaining exposure time if still exposing
+    // Check remaining exposure time
     struct timeval tv;
     gettimeofday(&tv, NULL);
     const double currentTime = tv.tv_sec + tv.tv_usec / 1000000.0;
@@ -505,7 +501,6 @@ long OriginCam::isExposing()
 
     if (remaining > 0) {
         const long usec = (long)(remaining * USEC_SEC);
-        // RTS2 is fine with any positive value; clamp to something sensible
         return (usec > 0 ? usec : (USEC_SEC / 10));
     }
 
@@ -517,43 +512,83 @@ int OriginCam::doReadout()
 {
     VLOG(MESSAGE_DEBUG) << "doReadout() called" << sendLog;
 
+    bool hasSnapshot = false;
     {
         std::lock_guard<std::mutex> lock(snapshotMutex);
-        if (!snapshotReady) {
-            VLOG(MESSAGE_DEBUG)
-                << "doReadout(): no pending snapshot (noop)"
-                << sendLog;
-            return 0;
+        hasSnapshot = snapshotReady;
+
+        if (!hasSnapshot) {
+            if (exposureInProgress) {
+                VLOG(MESSAGE_ERROR)
+                    << "doReadout(): called while exposure still in progress"
+                    << sendLog;
+                exposureInProgress = false;
+            } else {
+                VLOG(MESSAGE_ERROR)
+                    << "doReadout(): called but no snapshot ready and no exposure running"
+                    << sendLog;
+            }
+
+            snapshotArmed = false;
+            snapshotReady = false;
+
+            // Return -1 (error) to signal readout failure
+            return -1;
         }
+
+        // Clear snapshot flags NOW
         snapshotReady = false;
         snapshotArmed = false;
     }
 
-    uint16_t *dst =
-        reinterpret_cast<uint16_t *>(getDataBuffer(0));
+    // Clear exposureInProgress BEFORE sendImage/endReadout
+    exposureInProgress = false;
 
+    // Validate buffer
+    uint16_t *dst = reinterpret_cast<uint16_t *>(getDataBuffer(0));
     if (!dst) {
+        VLOG(MESSAGE_ERROR) << "doReadout(): getDataBuffer(0) == NULL" << sendLog;
+        return -1;
+    }
+
+    // Validate data
+    if (monoFrame.empty()) {
+        VLOG(MESSAGE_ERROR) << "doReadout(): monoFrame is empty" << sendLog;
+        return -1;
+    }
+
+    // Validate size
+    const size_t expectedPixels = 3056 * 2048;
+    if (monoFrame.size() != expectedPixels) {
         VLOG(MESSAGE_ERROR)
-            << "doReadout(): getDataBuffer(0) == NULL"
+            << "doReadout(): size mismatch - expected "
+            << expectedPixels << " got " << monoFrame.size()
             << sendLog;
         return -1;
     }
 
-    memcpy(dst, monoFrame.data(),
-           monoFrame.size() * sizeof(uint16_t));
+    // Copy image data
+    memcpy(dst, monoFrame.data(), monoFrame.size() * sizeof(uint16_t));
 
-    sendImage(reinterpret_cast<char*>(dst),
-              monoFrame.size() * sizeof(uint16_t));
+    // Send to RTS2
+    int ret = sendImage(reinterpret_cast<char*>(dst),
+                        monoFrame.size() * sizeof(uint16_t));
+    if (ret < 0) {
+        VLOG(MESSAGE_ERROR) << "doReadout(): sendImage failed" << sendLog;
+        return -1;
+    }
 
-    endReadout();
+    // End readout (this may trigger internal RTS2 callbacks)
+    ret = endReadout();
+    if (ret < 0) {
+        VLOG(MESSAGE_ERROR) << "doReadout(): endReadout failed" << sendLog;
+        return -1;
+    }
 
-    exposureInProgress = false;
+    VLOG(MESSAGE_INFO) << "doReadout(): image delivered OK" << sendLog;
 
-    VLOG(MESSAGE_INFO)
-        << "doReadout(): image delivered OK"
-        << sendLog;
-
-    return 0;
+    // ✅ CRITICAL FIX: Return -2 to signal "readout complete"
+    return -2;  // Was: return 0
 }
 
 int OriginCam::setCoolTemp(float new_temp)
