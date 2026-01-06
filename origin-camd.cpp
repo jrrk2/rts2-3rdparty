@@ -530,10 +530,7 @@ long OriginCam::isExposing()
 
 int OriginCam::doReadout()
 {
-    VLOG(MESSAGE_INFO) << "doReadout() called: "
-                       << "dataChannels=" << (dataChannels ? dataChannels->getValueInteger() : -999)
-                       << " channels=" << (channels ? channels->size() : 0)
-                       << sendLog;
+    VLOG(MESSAGE_DEBUG) << "doReadout() called" << sendLog;
 
     bool hasSnapshot = false;
     {
@@ -554,68 +551,107 @@ int OriginCam::doReadout()
 
             snapshotArmed = false;
             snapshotReady = false;
-
             return -1;
         }
 
-        // Clear snapshot flags NOW
         snapshotReady = false;
         snapshotArmed = false;
     }
 
-    // Clear exposureInProgress BEFORE sendImage/endReadout
     exposureInProgress = false;
 
-    // Validate buffer
-    uint16_t *dst = reinterpret_cast<uint16_t *>(getDataBuffer(0));
-    if (!dst) {
-        VLOG(MESSAGE_ERROR) << "doReadout(): getDataBuffer(0) == NULL" << sendLog;
+    // Create FITS filename
+    time_t now = time(nullptr);
+    struct tm *tm_info = gmtime(&now);
+    char filename[256];
+    snprintf(filename, sizeof(filename), 
+             "/home/jonathan/data/images/ORIGIN_CAM_%04d%02d%02d_%02d%02d%02d.fits",
+             tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
+             tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
+
+    // Write FITS file directly
+    if (!writeFITS(filename)) {
+        VLOG(MESSAGE_ERROR) << "Failed to write FITS: " << filename << sendLog;
         return -1;
     }
 
-    // Validate data
-    if (monoFrame.empty()) {
-        VLOG(MESSAGE_ERROR) << "doReadout(): monoFrame is empty" << sendLog;
-        return -1;
-    }
+    VLOG(MESSAGE_INFO) << "doReadout(): FITS file written to " << filename << sendLog;
 
-    // Validate size
-    const size_t expectedPixels = 3056 * 2048;
-    if (monoFrame.size() != expectedPixels) {
-        VLOG(MESSAGE_ERROR)
-            << "doReadout(): size mismatch - expected "
-            << expectedPixels << " got " << monoFrame.size()
-            << sendLog;
-        return -1;
-    }
-
-    VLOG(MESSAGE_INFO) << "doReadout(): about to call sendImage, size="
-                       << (monoFrame.size() * sizeof(uint16_t))
-                       << sendLog;
-
-    // Copy image data
-    memcpy(dst, monoFrame.data(), monoFrame.size() * sizeof(uint16_t));
-
-    // Send to RTS2
-    int ret = sendImage(reinterpret_cast<char*>(dst),
-                        monoFrame.size() * sizeof(uint16_t));
-    if (ret < 0) {
-        VLOG(MESSAGE_ERROR) << "doReadout(): sendImage failed" << sendLog;
-        return -1;
-    }
-
-    VLOG(MESSAGE_INFO) << "doReadout(): sendImage completed, calling endReadout()" << sendLog;
-
-    // End readout (this may trigger internal RTS2 callbacks)
-    ret = endReadout();
-    if (ret < 0) {
-        VLOG(MESSAGE_ERROR) << "doReadout(): endReadout failed" << sendLog;
-        return -1;
-    }
-
-    VLOG(MESSAGE_INFO) << "doReadout(): image delivered OK" << sendLog;
+    int ret = fitsDataTransfer(filename);
+    VLOG(MESSAGE_INFO) << "fitsDataTransfer returned: " << ret << sendLog;
 
     return -2;
+}
+
+bool OriginCam::writeFITS(const char *filename)
+{
+    fitsfile *fptr;
+    int status = 0;
+    long naxis = 2;
+    long naxes[2] = {3056, 2048};
+
+    // Create FITS file
+    fits_create_file(&fptr, filename, &status);
+    if (status) {
+        VLOG(MESSAGE_ERROR) << "fits_create_file failed: " << status << sendLog;
+        return false;
+    }
+
+    // Create image HDU
+    fits_create_img(fptr, USHORT_IMG, naxis, naxes, &status);
+    if (status) {
+        VLOG(MESSAGE_ERROR) << "fits_create_img failed: " << status << sendLog;
+        fits_close_file(fptr, &status);
+        return false;
+    }
+
+    // Write image data
+    fits_write_img(fptr, TUSHORT, 1, monoFrame.size(), 
+                   monoFrame.data(), &status);
+    if (status) {
+        VLOG(MESSAGE_ERROR) << "fits_write_img failed: " << status << sendLog;
+        fits_close_file(fptr, &status);
+        return false;
+    }
+
+    // Add basic keywords
+    fits_update_key(fptr, TSTRING, "INSTRUME", (void*)"ORIGIN_CAM", 
+                    "Camera name", &status);
+    
+    // ✅ Fix: store value in variable first
+    double exptime = exposureDuration;
+    fits_update_key(fptr, TDOUBLE, "EXPTIME", &exptime, 
+                    "Exposure time", &status);
+    
+    // ✅ Fix: store gain in variable first
+    int gainval = gain->getValueInteger();
+    fits_update_key(fptr, TINT, "GAIN", &gainval, 
+                    "ISO/Gain", &status);
+    
+    // Add more useful keywords
+    int binx = binningHorizontal();
+    int biny = binningVertical();
+    fits_update_key(fptr, TINT, "XBINNING", &binx, "Horizontal binning", &status);
+    fits_update_key(fptr, TINT, "YBINNING", &biny, "Vertical binning", &status);
+    
+    // Add timestamp
+    char dateobs[32];
+    time_t now = time(nullptr);
+    struct tm *tm_info = gmtime(&now);
+    snprintf(dateobs, sizeof(dateobs), "%04d-%02d-%02dT%02d:%02d:%02d",
+             tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
+             tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
+    fits_update_key(fptr, TSTRING, "DATE-OBS", dateobs, "UTC date/time of observation", &status);
+
+    // Close file
+    fits_close_file(fptr, &status);
+
+    if (status) {
+        VLOG(MESSAGE_ERROR) << "fits_close_file failed: " << status << sendLog;
+        return false;
+    }
+
+    return true;
 }
 
 int OriginCam::setCoolTemp(float new_temp)
