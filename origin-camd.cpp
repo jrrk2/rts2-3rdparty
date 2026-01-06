@@ -324,7 +324,6 @@ int OriginCam::initChips()
     const float pixelSize = 3.76f;
 
     initCameraChip(width, height, pixelSize, pixelSize);
-    // setNumChannels(1);
     initBinnings();
 
     VLOG(MESSAGE_INFO) << "Chip initialized: " << width << "x" << height
