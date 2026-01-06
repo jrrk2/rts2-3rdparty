@@ -315,10 +315,9 @@ int OriginCam::initHardware()
     return 0;
 }
 
-// --- REPLACE OriginCam::initChips() ---
 int OriginCam::initChips()
 {
-    // Celestron Origin has a Sony IMX410 sensor (as per your note)
+    // Celestron Origin has a Sony IMX410 sensor
     const int width = 3056;
     const int height = 2048;
     const float pixelSize = 3.76f;
@@ -326,8 +325,29 @@ int OriginCam::initChips()
     initCameraChip(width, height, pixelSize, pixelSize);
     initBinnings();
 
+    // ✅ Explicitly set single data channel
+    if (dataChannels) {
+        dataChannels->setValueInteger(1);
+        sendValueAll(dataChannels);
+    }
+
     VLOG(MESSAGE_INFO) << "Chip initialized: " << width << "x" << height
                        << " pixels, " << pixelSize << "µm" << sendLog;
+
+    return 0;
+}
+
+int OriginCam::initValues()
+{
+    // Call base class first
+    int ret = Camera::initValues();
+    if (ret)
+        return ret;
+
+    // ✅ For single-channel cameras, don't create dataChannels
+    // The base class will handle this correctly with defaults
+
+    VLOG(MESSAGE_INFO) << "initValues() completed (single-channel camera)" << sendLog;
 
     return 0;
 }
@@ -510,7 +530,10 @@ long OriginCam::isExposing()
 
 int OriginCam::doReadout()
 {
-    VLOG(MESSAGE_DEBUG) << "doReadout() called" << sendLog;
+    VLOG(MESSAGE_INFO) << "doReadout() called: "
+                       << "dataChannels=" << (dataChannels ? dataChannels->getValueInteger() : -999)
+                       << " channels=" << (channels ? channels->size() : 0)
+                       << sendLog;
 
     bool hasSnapshot = false;
     {
@@ -532,7 +555,6 @@ int OriginCam::doReadout()
             snapshotArmed = false;
             snapshotReady = false;
 
-            // Return -1 (error) to signal readout failure
             return -1;
         }
 
@@ -567,6 +589,10 @@ int OriginCam::doReadout()
         return -1;
     }
 
+    VLOG(MESSAGE_INFO) << "doReadout(): about to call sendImage, size="
+                       << (monoFrame.size() * sizeof(uint16_t))
+                       << sendLog;
+
     // Copy image data
     memcpy(dst, monoFrame.data(), monoFrame.size() * sizeof(uint16_t));
 
@@ -578,6 +604,8 @@ int OriginCam::doReadout()
         return -1;
     }
 
+    VLOG(MESSAGE_INFO) << "doReadout(): sendImage completed, calling endReadout()" << sendLog;
+
     // End readout (this may trigger internal RTS2 callbacks)
     ret = endReadout();
     if (ret < 0) {
@@ -587,8 +615,7 @@ int OriginCam::doReadout()
 
     VLOG(MESSAGE_INFO) << "doReadout(): image delivered OK" << sendLog;
 
-    // ✅ CRITICAL FIX: Return -2 to signal "readout complete"
-    return -2;  // Was: return 0
+    return -2;
 }
 
 int OriginCam::setCoolTemp(float new_temp)

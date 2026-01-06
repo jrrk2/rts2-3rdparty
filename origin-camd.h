@@ -56,6 +56,7 @@ protected:
     int switchCooling(bool cooling) override;
 
     int commandAuthorized(rts2core::Connection *conn) override;
+    virtual int initValues() override;
 
 private:
     std::vector<uint16_t> monoFrame;   // decoded RGGB image
