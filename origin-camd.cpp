@@ -324,6 +324,7 @@ int OriginCam::initChips()
     const float pixelSize = 3.76f;
 
     initCameraChip(width, height, pixelSize, pixelSize);
+    // setNumChannels(1);
     initBinnings();
 
     VLOG(MESSAGE_INFO) << "Chip initialized: " << width << "x" << height
@@ -513,10 +514,6 @@ long OriginCam::isExposing()
     return USEC_SEC / 10; // 100ms
 }
 
-// --- REPLACE OriginCam::doReadout() ---
-// Fixes:
-//  - Do NOT "succeed" unless snapshotReady is true (prevents RTS2 rejecting expose thereafter)
-//  - Clear latch and end exposure lifecycle
 int OriginCam::doReadout()
 {
     VLOG(MESSAGE_DEBUG) << "doReadout() called" << sendLog;
@@ -524,18 +521,39 @@ int OriginCam::doReadout()
     {
         std::lock_guard<std::mutex> lock(snapshotMutex);
         if (!snapshotReady) {
-            VLOG(MESSAGE_ERROR) << "doReadout(): called but snapshotReady=false (rejecting)" << sendLog;
-            return -1; // CRITICAL: don't let RTS2 think readout succeeded
+            VLOG(MESSAGE_DEBUG)
+                << "doReadout(): no pending snapshot (noop)"
+                << sendLog;
+            return 0;
         }
-
-        // We already sent the image inside decodeTIFF()->sendImage()->endReadout()
         snapshotReady = false;
         snapshotArmed = false;
     }
 
+    uint16_t *dst =
+        reinterpret_cast<uint16_t *>(getDataBuffer(0));
+
+    if (!dst) {
+        VLOG(MESSAGE_ERROR)
+            << "doReadout(): getDataBuffer(0) == NULL"
+            << sendLog;
+        return -1;
+    }
+
+    memcpy(dst, monoFrame.data(),
+           monoFrame.size() * sizeof(uint16_t));
+
+    sendImage(reinterpret_cast<char*>(dst),
+              monoFrame.size() * sizeof(uint16_t));
+
+    endReadout();
+
     exposureInProgress = false;
 
-    VLOG(MESSAGE_INFO) << "doReadout(): completed (image already delivered)" << sendLog;
+    VLOG(MESSAGE_INFO)
+        << "doReadout(): image delivered OK"
+        << sendLog;
+
     return 0;
 }
 
@@ -801,87 +819,62 @@ void OriginCam::handleImageReady(const std::string& filePath, double ra, double 
     VLOG(MESSAGE_INFO) << "Snapshot TIFF latched OK: " << filePath << sendLog;
 }
 
-// --- REPLACE OriginCam::decodeTIFF(const std::vector<uint8_t>&) ---
-// Adds verbose logging + sanity checks
 bool OriginCam::decodeTIFF(const std::vector<uint8_t> &imageData)
 {
-    // Write to temp file (libtiff needs a filename)
-    const std::string tmp = "/tmp/origin_snapshot.tiff";
+    const std::string tmp = "/tmp/origin_sample.tiff";
     {
         std::ofstream f(tmp, std::ios::binary);
         f.write(reinterpret_cast<const char*>(imageData.data()), imageData.size());
     }
 
     TIFF *tif = TIFFOpen(tmp.c_str(), "r");
-    if (!tif) {
-        VLOG(MESSAGE_ERROR) << "TIFFOpen failed for " << tmp << sendLog;
+    if (!tif)
         return false;
-    }
 
     uint32_t width = 0, height = 0;
-    uint16_t spp = 0, bps = 0, config = 0;
+    uint16_t spp = 0, bps = 0;
 
     TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &width);
     TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &height);
     TIFFGetField(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
     TIFFGetField(tif, TIFFTAG_BITSPERSAMPLE, &bps);
-    TIFFGetField(tif, TIFFTAG_PLANARCONFIG, &config);
 
-    VLOG(MESSAGE_INFO) << "TIFF meta: " << width << "x" << height
-                       << " spp=" << spp << " bps=" << bps
-                       << " planar=" << config << sendLog;
+    VLOG(MESSAGE_INFO)
+        << "TIFF meta: " << width << "x" << height
+        << " spp=" << spp << " bps=" << bps
+        << sendLog;
 
-    if (width == 0 || height == 0) {
+    if (width == 0 || height == 0 || spp != 3 || bps != 16) {
         TIFFClose(tif);
         return false;
     }
 
-    // Expect RGB 16-bit packed pixels (as per your working path)
-    if (spp != 3 || bps != 16) {
-        VLOG(MESSAGE_ERROR) << "Unexpected TIFF format: spp=" << spp << " bps=" << bps << " (expected 3x16)" << sendLog;
-        TIFFClose(tif);
-        return false;
-    }
+    monoFrame.resize((size_t)width * height);
 
-    const size_t planeSize = (size_t)width * (size_t)height;
+    std::vector<uint16_t> scanline(width * 3);
 
-    uint16_t *dst = reinterpret_cast<uint16_t *>(getDataBuffer(0));
-    if (!dst) {
-        VLOG(MESSAGE_ERROR) << "getDataBuffer(0) returned null" << sendLog;
-        TIFFClose(tif);
-        return false;
-    }
-
-    std::vector<uint16_t> scanline((size_t)width * 3);
-
-    for (uint32_t row = 0; row < height; row++)
-    {
-        if (TIFFReadScanline(tif, scanline.data(), row) < 0) {
-            VLOG(MESSAGE_ERROR) << "TIFFReadScanline failed at row " << row << sendLog;
+    for (uint32_t y = 0; y < height; y++) {
+        if (TIFFReadScanline(tif, scanline.data(), y) < 0) {
             TIFFClose(tif);
             return false;
         }
 
-        for (uint32_t col = 0; col < width; col++)
-        {
-            const size_t i = (size_t)row * (size_t)width + (size_t)col;
-            const size_t s = (size_t)col * 3;
+        for (uint32_t x = 0; x < width; x++) {
+            uint16_t R = scanline[x * 3 + 0];
+            uint16_t G = scanline[x * 3 + 1];
+            uint16_t B = scanline[x * 3 + 2];
 
-            dst[i]               = scanline[s + 0]; // R
-            dst[planeSize + i]   = scanline[s + 1]; // G
-            dst[planeSize*2 + i] = scanline[s + 2]; // B
+            uint16_t v;
+            if ((y & 1) == 0)
+                v = ((x & 1) == 0) ? R : G;   // RG
+            else
+                v = ((x & 1) == 0) ? G : B;   // GB
+
+            monoFrame[(size_t)y * width + x] = v;
         }
     }
 
     TIFFClose(tif);
-
-    // Deliver to RTS2
-    sendImage((char *)dst, planeSize * 3 * sizeof(uint16_t));
-    endReadout();
-
-    VLOG(MESSAGE_INFO) << "TIFF delivered to RTS2: bytes="
-                       << (planeSize * 3 * sizeof(uint16_t)) << sendLog;
-
     return true;
 }
 

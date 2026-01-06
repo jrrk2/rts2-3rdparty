@@ -58,6 +58,7 @@ protected:
     int commandAuthorized(rts2core::Connection *conn) override;
 
 private:
+    std::vector<uint16_t> monoFrame;   // decoded RGGB image
     // ---------------- Threading ----------------
     std::thread pollThread;
     std::atomic<bool> pollRunning{false};
