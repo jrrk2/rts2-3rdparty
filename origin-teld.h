@@ -1,6 +1,6 @@
 /*
- * Celestron Origin Telescope Driver for RTS2
- * 
+ * Celestron Origin Telescope Driver for RTS2 - Connect-on-Demand Version
+ *
  * Direct Ethernet communication with Celestron Origin mount
  */
 
@@ -8,14 +8,9 @@
 #define __RTS2_ORIGIN_TELD_H__
 
 #include "teld.h"
-#include "altaz.h"
-#include "connection/fork.h"
 #include <string>
-#include <memory>
-#include <thread>
-#include <atomic>
 
-// Forward declarations for Qt-free implementations
+// Forward declarations
 class OriginWebSocket;
 struct TelescopeStatus;
 
@@ -24,84 +19,86 @@ namespace rts2teld
 
 class Origin : public Telescope
 {
-    public:
-        Origin(int argc, char **argv);
-        virtual ~Origin();
+public:
+    Origin(int argc, char **argv);
+    virtual ~Origin();
 
-    protected:
-        virtual int processOption(int opt);
-        virtual int initHardware();
-        virtual int info();
+protected:
+    virtual int processOption(int opt);
+    virtual int initHardware();
+    virtual int info();
 
-        virtual bool needInfo();
-        
-        virtual int startResync();
-        virtual int isMoving();
-        virtual int stopMove();
-        virtual int startPark();
-        virtual int endPark();
-        virtual int isParking();
-        
-        virtual int setTo(double set_ra, double set_dec);
-        virtual int correct(double cor_ra, double cor_dec, double real_ra, double real_dec);
-        
-	virtual bool isSafe();
-	virtual void valueChanged (rts2core::Value *changed_value) override;
+    virtual bool needInfo();
+    virtual bool isSafe();
+    virtual void valueChanged(rts2core::Value *changed_value);
 
-    private:
-        // Connection parameters
-        std::string telescopeHost;
-        int telescopePort;
-        bool useDiscovery;  // NEW: Auto-discover telescope
-        
-        // WebSocket connection
-        OriginWebSocket *webSocket;
-        bool connected;
-        
-        // Telescope status
-        TelescopeStatus *status;
-        int nextSequenceId;
-        
-        // Coordinate tracking
-        double targetRA;
-        double targetDec;
-        bool gotoInProgress;
-        
-        // Methods
-        bool connectToTelescope();
-        void disconnectFromTelescope();
-        bool sendCommand(const std::string& command, const std::string& destination,
-                        const std::string& params = "");
-        void processMessage(const std::string& message);
-        void updateTelescopeStatus(const std::string& jsonData);
-        
-        // Discovery
-        bool discoverTelescope();
-        bool startDiscovery();
-        void stopDiscovery();
-        void pollDiscovery();
-        
-        // Discovery state
-        int discoverySocket;
-        bool discovering;
-        time_t discoveryStartTime;
-        
-        // Coordinate conversion
-        void j2000ToJNow(double ra_j2000, double dec_j2000, double *ra_jnow, double *dec_jnow);
-        void jnowToJ2000(double ra_jnow, double dec_jnow, double *ra_j2000, double *dec_j2000);
-        
-        // RTS2 values
-        rts2core::ValueString *telescopeAddress;
-        rts2core::ValueBool *isAligned;
-        rts2core::ValueBool *trackingEnabled;
-        rts2core::ValueDouble *batteryVoltage;
-        rts2core::ValueDouble *temperature;
-	std::thread keepaliveThread;
-	std::atomic<bool> keepaliveRunning{false};
-	std::thread rxThread;
-	std::atomic<bool> rxRunning{false};
-	bool siteLocationSet = false;
-	bool raDecSet = false;
+    virtual int startResync();
+    virtual int isMoving();
+    virtual int stopMove();
+    virtual int startPark();
+    virtual int endPark();
+    virtual int isParking();
+
+    virtual int setTo(double set_ra, double set_dec);
+    virtual int correct(double cor_ra, double cor_dec, double real_ra, double real_dec);
+
+private:
+    // Connection parameters
+    std::string telescopeHost;
+    int telescopePort;
+    bool useDiscovery;
+
+    // WebSocket connection
+    OriginWebSocket *webSocket;
+    bool connected;
+
+    // Operation state (NEW for connect-on-demand)
+    bool operationActive;
+    time_t lastStatusUpdate;
+
+    // Telescope status
+    TelescopeStatus *status;
+    int nextSequenceId;
+
+    // Coordinate tracking
+    bool gotoInProgress;
+    bool siteLocationSet;
+    bool raDecSet;
+
+    // Discovery state
+    int discoverySocket;
+    bool discovering;
+    time_t discoveryStartTime;
+
+    // RTS2 values
+    rts2core::ValueString *telescopeAddress;
+    rts2core::ValueBool *isAligned;
+    rts2core::ValueBool *trackingEnabled;
+    rts2core::ValueDouble *batteryVoltage;
+    rts2core::ValueDouble *temperature;
+
+    // Connection methods (NEW for connect-on-demand)
+    bool ensureConnected();
+    bool connectToTelescope();
+    void disconnectFromTelescope();
+    void pollMessages();
+
+    // Communication
+    bool sendCommand(const std::string& command,
+                     const std::string& destination = "Mount",
+                     const std::string& params = "");
+    void processMessage(const std::string& message);
+    void updateTelescopeStatus(const std::string& jsonData);
+
+    // Discovery
+    bool discoverTelescope();
+    bool startDiscovery();
+    void stopDiscovery();
+    void pollDiscovery();
+
+    // Coordinate conversion
+    void j2000ToJNow(double ra_j2000, double dec_j2000, double *ra_jnow, double *dec_jnow);
+    void jnowToJ2000(double ra_jnow, double dec_jnow, double *ra_j2000, double *dec_j2000);
 };
 
 }

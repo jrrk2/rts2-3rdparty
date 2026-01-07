@@ -1,13 +1,11 @@
 /*
- * Celestron Origin Camera Driver for RTS2
- * Drop-in replacement for origin-camd.cpp
+ * Celestron Origin Camera Driver for RTS2 - Connect-on-Demand Version
  *
- * Key fixes vs previous version:
- *  - Uses SequenceID (not Sequence) in outbound messages
- *  - Treats preview JPEG stream as background noise (never completes exposure)
- *  - Arms a one-shot latch on Snapshot; completes exposure ONLY when a TIFF arrives
- *  - Moves download/decode/sendImage/endReadout into RTS2 thread (doReadout),
- *    not the WebSocket RX thread (thread-safety / RTS2 lifecycle correctness)
+ * Key changes:
+ *  - No persistent WebSocket connection
+ *  - Connects only when starting exposure
+ *  - Disconnects after image received
+ *  - Uses short-lived connection model to avoid conflicts with telescope driver
  */
 
 #include "origin-camd.h"
@@ -32,18 +30,13 @@
 #include <iostream>
 #include <algorithm>
 
-// Network headers for discovery
+// Network headers
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <errno.h>
-
-// HTTP download headers
 #include <netdb.h>
-// --- ADD near top of origin-camd.cpp (after includes) ---
-#include <mutex>
-#include <chrono>
 
 #ifndef ORIGIN_CAM_VERBOSE
 #define ORIGIN_CAM_VERBOSE 1
@@ -66,10 +59,8 @@ static inline bool ends_with(const std::string& s, const std::string& suf)
     return s.size() >= suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
 }
 
-// --- ADD helper near top of origin-camd.cpp ---
 static inline bool isJPEG(const std::vector<uint8_t>& data)
 {
-    // JPEG files start with: FF D8 FF
     return data.size() >= 3 &&
            data[0] == 0xFF &&
            data[1] == 0xD8 &&
@@ -80,7 +71,7 @@ static inline bool isJPEG(const std::vector<uint8_t>& data)
 #define USEC_SEC 1000000L
 #endif
 
-// Reuse the SimpleJSON class from telescope driver
+// SimpleJSON class (same as before)
 class SimpleJSON {
 public:
     static std::map<std::string, std::string> parse(const std::string& json) {
@@ -163,32 +154,6 @@ public:
 
 using namespace rts2camd;
 
-static inline double nowSeconds()
-{
-    struct timeval tv;
-    gettimeofday(&tv, nullptr);
-    return (double)tv.tv_sec + (double)tv.tv_usec / 1e6;
-}
-
-static inline bool ends_with_ci(const std::string& s, const std::string& suffix)
-{
-    if (s.size() < suffix.size()) return false;
-    auto it = s.end() - (ptrdiff_t)suffix.size();
-    for (size_t i = 0; i < suffix.size(); i++) {
-        char a = (char)tolower((unsigned char)*(it + (ptrdiff_t)i));
-        char b = (char)tolower((unsigned char)suffix[i]);
-        if (a != b) return false;
-    }
-    return true;
-}
-
-static inline std::string basename_only(const std::string& p)
-{
-    auto slash = p.find_last_of('/');
-    if (slash == std::string::npos) return p;
-    return p.substr(slash + 1);
-}
-
 OriginCam::OriginCam(int argc, char **argv)
     : Camera(argc, argv)
 {
@@ -206,7 +171,6 @@ OriginCam::OriginCam(int argc, char **argv)
     exposureDuration = 0;
     exposureInProgress = false;
 
-    // Snapshot latch state
     snapshotArmed = false;
     snapshotReady = false;
     snapshotArmTime = 0.0;
@@ -227,7 +191,7 @@ OriginCam::OriginCam(int argc, char **argv)
     createValue(gain, "GAIN", "camera ISO/gain", true, RTS2_VALUE_WRITABLE);
     gain->setValueInteger(100);
 
-    createValue(previewMode, "PREVIEW", "preview mode (faster downloads) (FYI: Origin preview stream is always on)", true, RTS2_VALUE_WRITABLE);
+    createValue(previewMode, "PREVIEW", "preview mode", true, RTS2_VALUE_WRITABLE);
     previewMode->setValueBool(false);
 
     createValue(ccdTemp, "CCD_TEMP", "CCD temperature", false);
@@ -279,10 +243,8 @@ int OriginCam::processOption(int opt)
     }
 }
 
-// --- REPLACE OriginCam::initHardware() ---
 int OriginCam::initHardware()
 {
-    // If no address specified, use discovery
     if (telescopeHost.empty())
         useDiscovery = true;
 
@@ -290,7 +252,7 @@ int OriginCam::initHardware()
         VLOG(MESSAGE_INFO) << "Starting telescope discovery..." << sendLog;
 
         if (!discoverTelescope()) {
-            VLOG(MESSAGE_ERROR) << "Failed to discover telescope. You can specify IP with -a option." << sendLog;
+            VLOG(MESSAGE_ERROR) << "Failed to discover telescope." << sendLog;
             return -1;
         }
 
@@ -299,25 +261,19 @@ int OriginCam::initHardware()
     }
 
     if (telescopeHost.empty()) {
-        VLOG(MESSAGE_ERROR) << "Telescope IP address not specified and discovery failed. Use -a option or -D for discovery." << sendLog;
+        VLOG(MESSAGE_ERROR) << "Telescope IP address not specified." << sendLog;
         return -1;
     }
 
-    if (!connectToTelescope()) {
-        VLOG(MESSAGE_ERROR) << "Failed to connect to telescope at " << telescopeHost << ":" << telescopePort << sendLog;
-        return -1;
-    }
+    // Don't connect here - connect on demand
+    VLOG(MESSAGE_INFO) << "Origin camera initialized (connect-on-demand mode)" << sendLog;
 
-    VLOG(MESSAGE_INFO) << "Origin camera initialized successfully" << sendLog;
-
-    // CRITICAL: ensure RTS2 sees a valid exposable chip
     initChips();
     return 0;
 }
 
 int OriginCam::initChips()
 {
-    // Celestron Origin has a Sony IMX410 sensor
     const int width = 3056;
     const int height = 2048;
     const float pixelSize = 3.76f;
@@ -325,111 +281,49 @@ int OriginCam::initChips()
     initCameraChip(width, height, pixelSize, pixelSize);
     initBinnings();
 
-    // ✅ Explicitly set single data channel
     if (dataChannels) {
         dataChannels->setValueInteger(1);
         sendValueAll(dataChannels);
     }
 
-    VLOG(MESSAGE_INFO) << "Chip initialized: " << width << "x" << height
-                       << " pixels, " << pixelSize << "µm" << sendLog;
+    VLOG(MESSAGE_INFO) << "Chip initialized: " << width << "x" << height << sendLog;
 
     return 0;
 }
 
 int OriginCam::initValues()
 {
-    // Call base class first
-    int ret = Camera::initValues();
-    if (ret)
-        return ret;
-
-    // ✅ For single-channel cameras, don't create dataChannels
-    // The base class will handle this correctly with defaults
-
-    VLOG(MESSAGE_INFO) << "initValues() completed (single-channel camera)" << sendLog;
-
-    return 0;
+    return Camera::initValues();
 }
 
-// --- REPLACE OriginCam::pollLoop() ---
-void OriginCam::pollLoop()
-{
-    VLOG(MESSAGE_INFO) << "pollLoop started" << sendLog;
-
-    while (pollRunning)
-    {
-        if (webSocket && webSocket->isConnected())
-        {
-            int drained = 0;
-            while (webSocket->hasData())
-            {
-                std::string msg = webSocket->receiveText();
-                if (!msg.empty()) {
-                    drained++;
-                    processMessage(msg);
-                }
-            }
-
-#if ORIGIN_CAM_VERBOSE
-            if (drained > 0 && drained > 50) {
-                VLOG(MESSAGE_DEBUG) << "pollLoop drained " << drained << " messages this tick" << sendLog;
-            }
-#endif
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
-
-    VLOG(MESSAGE_INFO) << "pollLoop exiting" << sendLog;
-}
-
-// --- REPLACE OriginCam::info() ---
-// Adds helpful status logging and avoids spamming
 int OriginCam::info()
 {
     if (cameraStatus && cameraStatus->lastUpdate > 0) {
-        // Many Origin firmwares call it CameraTemperature (not CCD_TEMP); we just reflect what we have.
         ccdTemp->setValueDouble(cameraStatus->temperature);
     }
-
-#if ORIGIN_CAM_VERBOSE
-    static time_t last = 0;
-    time_t now = time(nullptr);
-    if (now != last && (now % 5) == 0) {
-        std::lock_guard<std::mutex> lock(snapshotMutex);
-        VLOG(MESSAGE_INFO) << "status: connected=" << (connected ? "yes" : "no")
-                           << " exposing=" << (exposureInProgress ? "yes" : "no")
-                           << " armed=" << (snapshotArmed ? "yes" : "no")
-                           << " ready=" << (snapshotReady ? "yes" : "no")
-                           << " exp=" << exposureDuration
-                           << " ISO=" << (gain ? gain->getValueInteger() : -1)
-                           << sendLog;
-        last = now;
-    }
-#endif
 
     return Camera::info();
 }
 
-// --- REPLACE OriginCam::startExposure() ---
-// Fixes:
-//  - Arms snapshot latch BEFORE sending command (so we can't miss the TIFF)
-//  - Forces PREVIEW value true in UI but does NOT attempt to disable device preview (device ignores)
-//  - Uses consistent JSON key naming (SequenceID etc. handled in sendCommand)
-//  - Verbose logging
+// REVISED: Connect → Expose → Wait → Disconnect
 int OriginCam::startExposure()
 {
-    VLOG(MESSAGE_INFO) << "startExposure() called" << sendLog;
+    VLOG(MESSAGE_INFO) << "startExposure() - connecting to telescope..." << sendLog;
 
     if (exposureInProgress) {
         VLOG(MESSAGE_ERROR) << "Exposure already in progress" << sendLog;
         return -1;
     }
 
+    // Connect to telescope
+    if (!connectToTelescope()) {
+        VLOG(MESSAGE_ERROR) << "Failed to connect for exposure" << sendLog;
+        return -1;
+    }
+
     exposureDuration = getExposure();
 
-    // Arm snapshot latch first (race-proof)
+    // Arm snapshot latch
     {
         std::lock_guard<std::mutex> lock(snapshotMutex);
         snapshotArmed = true;
@@ -440,28 +334,24 @@ int OriginCam::startExposure()
         pendingImageDec = 0.0;
     }
 
-    // Build capture command params
+    // Build capture command
     std::ostringstream paramsJson;
     paramsJson << "{"
                << "\"Exposure\":" << exposureDuration << ","
                << "\"ISO\":" << gain->getValueInteger() << ","
                << "\"Binning\":" << binningHorizontal() << ","
-               << "\"ImageType\":\"" << (previewMode->getValueBool() ? "Preview" : "Full") << "\""
+               << "\"ImageType\":\"Full\""
                << "}";
 
-    // NOTE: device preview is always on; ImageType here likely only affects snapshot type/size.
     VLOG(MESSAGE_INFO) << "Sending Snapshot: Exposure=" << exposureDuration
-                       << " ISO=" << gain->getValueInteger()
-                       << " Bin=" << binningHorizontal()
-                       << " ImageType=" << (previewMode->getValueBool() ? "Preview" : "Full")
-                       << " (device preview stream remains ON)" << sendLog;
+                       << " ISO=" << gain->getValueInteger() << sendLog;
 
     if (!sendCommand("RunSampleCapture", "TaskController", paramsJson.str())) {
         VLOG(MESSAGE_ERROR) << "sendCommand(Snapshot) failed" << sendLog;
-        // Disarm latch on failure
         std::lock_guard<std::mutex> lock(snapshotMutex);
         snapshotArmed = false;
         snapshotReady = false;
+        disconnectFromTelescope();
         return -1;
     }
 
@@ -473,8 +363,6 @@ int OriginCam::startExposure()
     return 0;
 }
 
-// --- REPLACE OriginCam::stopExposure() ---
-// Fix: also disarm snapshot latch
 int OriginCam::stopExposure()
 {
     VLOG(MESSAGE_INFO) << "stopExposure() called" << sendLog;
@@ -483,7 +371,9 @@ int OriginCam::stopExposure()
         return 0;
     }
 
-    sendCommand("Abort", "Camera");
+    if (connected) {
+        sendCommand("Abort", "Camera");
+    }
 
     exposureInProgress = false;
 
@@ -493,23 +383,34 @@ int OriginCam::stopExposure()
         snapshotReady = false;
     }
 
+    disconnectFromTelescope();
+
     VLOG(MESSAGE_INFO) << "Exposure aborted" << sendLog;
     return 0;
 }
 
 long OriginCam::isExposing()
 {
-    // If we are not in an exposure cycle, RTS2 expects -2 (idle)
     if (!exposureInProgress) {
         return -2;
     }
 
-    // If TIFF is latched, signal completion to RTS2
+    // Check if TIFF is ready
     {
         std::lock_guard<std::mutex> lock(snapshotMutex);
         if (snapshotReady) {
-            VLOG(MESSAGE_DEBUG) << "isExposing(): snapshotReady -> returning -2" << sendLog;
-            return -2;  // This is correct - tells RTS2 to call doReadout()
+            VLOG(MESSAGE_DEBUG) << "isExposing(): snapshotReady" << sendLog;
+            return -2;
+        }
+    }
+
+    // Poll WebSocket for messages while waiting
+    if (webSocket && webSocket->isConnected()) {
+        while (webSocket->hasData()) {
+            std::string msg = webSocket->receiveText();
+            if (!msg.empty()) {
+                processMessage(msg);
+            }
         }
     }
 
@@ -524,8 +425,8 @@ long OriginCam::isExposing()
         return (usec > 0 ? usec : (USEC_SEC / 10));
     }
 
-    // Exposure time elapsed: keep RTS2 polling until TIFF arrives
-    return USEC_SEC / 10; // 100ms
+    // Keep polling until TIFF arrives
+    return USEC_SEC / 10;
 }
 
 int OriginCam::doReadout()
@@ -538,19 +439,10 @@ int OriginCam::doReadout()
         hasSnapshot = snapshotReady;
 
         if (!hasSnapshot) {
-            if (exposureInProgress) {
-                VLOG(MESSAGE_ERROR)
-                    << "doReadout(): called while exposure still in progress"
-                    << sendLog;
-                exposureInProgress = false;
-            } else {
-                VLOG(MESSAGE_ERROR)
-                    << "doReadout(): called but no snapshot ready and no exposure running"
-                    << sendLog;
-            }
-
+            VLOG(MESSAGE_ERROR) << "doReadout(): no snapshot ready" << sendLog;
             snapshotArmed = false;
             snapshotReady = false;
+            disconnectFromTelescope();
             return -1;
         }
 
@@ -560,7 +452,9 @@ int OriginCam::doReadout()
 
     exposureInProgress = false;
 
-    // Validate data
+    // Disconnect AFTER receiving image
+    disconnectFromTelescope();
+
     if (monoFrame.empty()) {
         VLOG(MESSAGE_ERROR) << "doReadout(): monoFrame is empty" << sendLog;
         return -1;
@@ -575,18 +469,16 @@ int OriginCam::doReadout()
              tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
              tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
 
-    // ✅ Write FITS using RTS2's method (like dummy camera)
     if (!writeFITSforRTS2(filename)) {
         VLOG(MESSAGE_ERROR) << "Failed to write FITS: " << filename << sendLog;
         return -1;
     }
 
-    // ✅ Tell RTS2/imgproc about the file
     VLOG(MESSAGE_INFO) << "Calling fitsDataTransfer for: " << filename << sendLog;
     int ret = fitsDataTransfer(filename);
     VLOG(MESSAGE_INFO) << "fitsDataTransfer returned: " << ret << sendLog;
 
-    return -2;  // Readout complete
+    return -2;
 }
 
 bool OriginCam::writeFITSforRTS2(const char *filename)
@@ -595,14 +487,12 @@ bool OriginCam::writeFITSforRTS2(const char *filename)
     int status = 0;
     long naxes[2] = {3056, 2048};
 
-    // Create FITS file
     fits_create_file(&fptr, filename, &status);
     if (status) {
         VLOG(MESSAGE_ERROR) << "fits_create_file failed: " << status << sendLog;
         return false;
     }
 
-    // Create image HDU
     fits_create_img(fptr, USHORT_IMG, 2, naxes, &status);
     if (status) {
         VLOG(MESSAGE_ERROR) << "fits_create_img failed: " << status << sendLog;
@@ -610,7 +500,6 @@ bool OriginCam::writeFITSforRTS2(const char *filename)
         return false;
     }
 
-    // Write image data (like dummy camera does)
     fits_write_img(fptr, TUSHORT, 1, monoFrame.size(),
                    (uint16_t*)monoFrame.data(), &status);
     if (status) {
@@ -619,63 +508,54 @@ bool OriginCam::writeFITSforRTS2(const char *filename)
         return false;
     }
 
-    // Add basic keywords
+    // Add keywords
     char instrume[] = "ORIGIN_CAM";
-    fits_update_key(fptr, TSTRING, "INSTRUME", instrume,
-                    "Camera name", &status);
+    fits_update_key(fptr, TSTRING, "INSTRUME", instrume, "Camera name", &status);
 
     double exptime = exposureDuration;
-    fits_update_key(fptr, TDOUBLE, "EXPTIME", &exptime,
-                    "Exposure time", &status);
+    fits_update_key(fptr, TDOUBLE, "EXPTIME", &exptime, "Exposure time", &status);
 
     int gainval = gain->getValueInteger();
-    fits_update_key(fptr, TINT, "GAIN", &gainval,
-                    "ISO/Gain", &status);
+    fits_update_key(fptr, TINT, "GAIN", &gainval, "ISO/Gain", &status);
 
     int binx = binningHorizontal();
     int biny = binningVertical();
     fits_update_key(fptr, TINT, "XBINNING", &binx, "Horizontal binning", &status);
     fits_update_key(fptr, TINT, "YBINNING", &biny, "Vertical binning", &status);
 
-    // Add timestamp
     char dateobs[32];
-    time_t now = time(nullptr);
-    struct tm *tm_info = gmtime(&now);
+    time_t now_time = time(nullptr);
+    struct tm *tm_info = gmtime(&now_time);
     snprintf(dateobs, sizeof(dateobs), "%04d-%02d-%02dT%02d:%02d:%02d",
              tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
              tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
-    fits_update_key(fptr, TSTRING, "DATE-OBS", dateobs,
-                    "UTC date/time of observation", &status);
+    fits_update_key(fptr, TSTRING, "DATE-OBS", dateobs, "UTC date/time", &status);
 
-    // Close file
     fits_close_file(fptr, &status);
 
     if (status) {
-        VLOG(MESSAGE_ERROR) << "FITS write completed with errors: " << status << sendLog;
+        VLOG(MESSAGE_ERROR) << "FITS write errors: " << status << sendLog;
         return false;
     }
 
-    VLOG(MESSAGE_INFO) << "FITS file written successfully: " << filename << sendLog;
+    VLOG(MESSAGE_INFO) << "FITS file written: " << filename << sendLog;
     return true;
 }
 
 int OriginCam::setCoolTemp(float new_temp)
 {
     (void)new_temp;
-    logStream(MESSAGE_WARNING) << "Temperature control not supported on Origin" << sendLog;
     return -1;
 }
 
 int OriginCam::switchCooling(bool cooling)
 {
     (void)cooling;
-    logStream(MESSAGE_WARNING) << "Cooling control not supported on Origin" << sendLog;
     return -1;
 }
 
-// -------------------- Private methods --------------------
+// ---------- REVISED: Short-lived connection ----------
 
-// --- REPLACE OriginCam::connectToTelescope() ---
 bool OriginCam::connectToTelescope()
 {
     if (webSocket) {
@@ -685,9 +565,7 @@ bool OriginCam::connectToTelescope()
 
     webSocket = new OriginWebSocket();
 
-    VLOG(MESSAGE_INFO) << "Connecting WebSocket to "
-                       << telescopeHost << ":" << telescopePort
-                       << " path=/SmartScope-1.0/mountControlEndpoint" << sendLog;
+    VLOG(MESSAGE_INFO) << "Connecting WebSocket to " << telescopeHost << sendLog;
 
     if (!webSocket->connect(telescopeHost, telescopePort, "/SmartScope-1.0/mountControlEndpoint")) {
         VLOG(MESSAGE_ERROR) << "WebSocket connection failed" << sendLog;
@@ -697,23 +575,12 @@ bool OriginCam::connectToTelescope()
     }
 
     connected = true;
-
-    // Good to query parameters once; device will still spam preview.
-    sendCommand("GetCaptureParameters", "Camera");
-
     VLOG(MESSAGE_INFO) << "Connected to camera via WebSocket" << sendLog;
-
-    pollRunning = true;
-    pollThread = std::thread(&OriginCam::pollLoop, this);
     return true;
 }
 
 void OriginCam::disconnectFromTelescope()
 {
-    pollRunning = false;
-    if (pollThread.joinable())
-        pollThread.join();
-
     if (webSocket) {
         webSocket->disconnect();
         delete webSocket;
@@ -721,16 +588,15 @@ void OriginCam::disconnectFromTelescope()
     }
 
     connected = false;
+    VLOG(MESSAGE_INFO) << "Disconnected from telescope" << sendLog;
 }
 
-// --- REPLACE OriginCam::sendCommand(...) ---
-// Fix: use SequenceID (matches mount driver + trace), and log full JSON
 bool OriginCam::sendCommand(const std::string& command,
                             const std::string& destination,
                             const std::string& params)
 {
     if (!webSocket || !webSocket->isConnected()) {
-        VLOG(MESSAGE_ERROR) << "sendCommand(" << command << "): websocket not connected" << sendLog;
+        VLOG(MESSAGE_ERROR) << "sendCommand: not connected" << sendLog;
         return false;
     }
 
@@ -745,17 +611,15 @@ bool OriginCam::sendCommand(const std::string& command,
 
     if (!params.empty())
     {
-        // message ends with "}"
         if (!message.empty() && message.back() == '}')
             message.pop_back();
 
-        // params begins with "{"
         std::string p = params;
         if (!p.empty() && p.front() == '{')
             p.erase(p.begin());
 
         message += ",";
-        message += p; // ends with "}"
+        message += p;
     }
 
     VLOG(MESSAGE_DEBUG) << "WS SEND: " << message << sendLog;
@@ -763,10 +627,6 @@ bool OriginCam::sendCommand(const std::string& command,
     return webSocket->sendText(message);
 }
 
-// --- REPLACE OriginCam::processMessage() ---
-// Fixes:
-//  - robust routing: accept Notifications/Responses, but NewImageReady is always spammy
-//  - verbose logging for Snapshot window
 void OriginCam::processMessage(const std::string& message)
 {
     auto data = SimpleJSON::parse(message);
@@ -778,14 +638,6 @@ void OriginCam::processMessage(const std::string& message)
     if (type != "Notification" && type != "Response") {
         return;
     }
-
-#if ORIGIN_CAM_VERBOSE
-    if (command == "NewImageReady" || command == "GetCaptureParameters" || command == "GetStatus") {
-        // keep light; NewImageReady is very frequent
-    } else {
-        VLOG(MESSAGE_DEBUG) << "WS msg: Source=" << source << " Command=" << command << " Type=" << type << sendLog;
-    }
-#endif
 
     if (source == "Camera") {
         updateCameraStatus(message);
@@ -803,8 +655,6 @@ void OriginCam::processMessage(const std::string& message)
     }
 }
 
-// // --- REPLACE OriginCam::updateCameraStatus(...) ---
-// Adds verbose logging + stores temperature if present in payload
 void OriginCam::updateCameraStatus(const std::string& jsonData)
 {
     auto data = SimpleJSON::parse(jsonData);
@@ -818,68 +668,36 @@ void OriginCam::updateCameraStatus(const std::string& jsonData)
     if (data.find("Binning") != data.end()) {
         try { cameraStatus->binning = std::stoi(data["Binning"]); } catch (...) {}
     }
-
-    // Trace shows "CameraTemperature"
     if (data.find("CameraTemperature") != data.end()) {
         try { cameraStatus->temperature = std::stod(data["CameraTemperature"]); } catch (...) {}
     }
 
     cameraStatus->lastUpdate = time(nullptr);
-
-#if ORIGIN_CAM_VERBOSE
-    // Don't spam; log occasionally if you want:
-    // VLOG(MESSAGE_DEBUG) << "CameraStatus updated (ISO=" << cameraStatus->iso
-    //                    << " exp=" << cameraStatus->exposure
-    //                    << " bin=" << cameraStatus->binning
-    //                    << " temp=" << cameraStatus->temperature << ")" << sendLog;
-#endif
 }
 
-// --- REPLACE OriginCam::handleImageReady() ---
-// Fixes:
-//  - Ignore all JPEG preview frames always
-//  - Only accept TIFF when snapshotArmed is true and after snapshotArmTime
-//  - When accepted, download and decode TIFF and set snapshotReady=true
 void OriginCam::handleImageReady(const std::string& filePath, double ra, double dec)
 {
     if (filePath.empty())
         return;
 
-    const bool isJpg  = ends_with(filePath, ".jpg")  || ends_with(filePath, ".jpeg") || ends_with(filePath, ".JPG") || ends_with(filePath, ".JPEG");
-    const bool isTiff = ends_with(filePath, ".tif")  || ends_with(filePath, ".tiff")|| ends_with(filePath, ".TIF") || ends_with(filePath, ".TIFF");
+    const bool isJpg  = ends_with(filePath, ".jpg")  || ends_with(filePath, ".jpeg");
+    const bool isTiff = ends_with(filePath, ".tif")  || ends_with(filePath, ".tiff");
 
-    // Always ignore preview JPEG spam at RTS2 boundary
     if (isJpg) {
-#if ORIGIN_CAM_VERBOSE
-        // keep this very quiet; uncomment if you want spam:
-        // VLOG(MESSAGE_DEBUG) << "Ignoring preview JPEG: " << filePath << sendLog;
-#endif
-        return;
+        return;  // Ignore preview
     }
 
-    // If it's not TIFF/JPEG, ignore
     if (!isTiff) {
-        VLOG(MESSAGE_DEBUG) << "Ignoring NewImageReady non-TIFF: " << filePath << sendLog;
         return;
     }
 
-    // Decide if we should accept this TIFF as the snapshot frame
-    double armTime = 0.0;
-    bool armed = false;
+    // Check if armed
     {
         std::lock_guard<std::mutex> lock(snapshotMutex);
-        armed = snapshotArmed;
-        armTime = snapshotArmTime;
-        if (!armed) {
-            VLOG(MESSAGE_INFO) << "TIFF arrived but snapshot not armed; ignoring: " << filePath << sendLog;
+        if (!snapshotArmed) {
+            VLOG(MESSAGE_INFO) << "TIFF arrived but not armed: " << filePath << sendLog;
             return;
         }
-    }
-
-    const double t = now_s();
-    if (t + 0.001 < armTime) { // should never happen, but be strict
-        VLOG(MESSAGE_INFO) << "TIFF arrived before armTime (stale?); ignoring: " << filePath << sendLog;
-        return;
     }
 
     pendingImagePath = filePath;
@@ -888,37 +706,31 @@ void OriginCam::handleImageReady(const std::string& filePath, double ra, double 
 
     const std::string url = "http://" + telescopeHost + "/SmartScope-1.0/dev2/" + filePath;
 
-    VLOG(MESSAGE_INFO) << "Snapshot TIFF candidate: " << filePath
-                       << " RA=" << ra << " Dec=" << dec
-                       << " url=" << url << sendLog;
+    VLOG(MESSAGE_INFO) << "Downloading TIFF: " << filePath << sendLog;
 
     std::vector<uint8_t> imageData = downloadImageSync(url);
 
     if (imageData.empty()) {
-        VLOG(MESSAGE_ERROR) << "TIFF download failed for " << filePath << sendLog;
-        // keep exposureInProgress true; RTS2 will continue to poll isExposing()
+        VLOG(MESSAGE_ERROR) << "TIFF download failed" << sendLog;
         return;
     }
 
-    // If server mistakenly delivers JPEG payload at TIFF path, reject
     if (isJPEG(imageData)) {
-        VLOG(MESSAGE_WARNING) << "Received JPEG payload for supposed TIFF " << filePath << " (ignoring)" << sendLog;
+        VLOG(MESSAGE_WARNING) << "Got JPEG for TIFF path (ignoring)" << sendLog;
         return;
     }
 
     if (!decodeTIFF(imageData)) {
-        VLOG(MESSAGE_ERROR) << "TIFF decode failed for " << filePath << sendLog;
+        VLOG(MESSAGE_ERROR) << "TIFF decode failed" << sendLog;
         return;
     }
 
-    // Mark snapshot ready for RTS2 state machine
     {
         std::lock_guard<std::mutex> lock(snapshotMutex);
         snapshotReady = true;
-        // keep armed true until doReadout clears it (safer)
     }
 
-    VLOG(MESSAGE_INFO) << "Snapshot TIFF latched OK: " << filePath << sendLog;
+    VLOG(MESSAGE_INFO) << "Snapshot TIFF ready: " << filePath << sendLog;
 }
 
 bool OriginCam::decodeTIFF(const std::vector<uint8_t> &imageData)
@@ -940,11 +752,6 @@ bool OriginCam::decodeTIFF(const std::vector<uint8_t> &imageData)
     TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &height);
     TIFFGetField(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
     TIFFGetField(tif, TIFFTAG_BITSPERSAMPLE, &bps);
-
-    VLOG(MESSAGE_INFO)
-        << "TIFF meta: " << width << "x" << height
-        << " spp=" << spp << " bps=" << bps
-        << sendLog;
 
     if (width == 0 || height == 0 || spp != 3 || bps != 16) {
         TIFFClose(tif);
@@ -968,9 +775,9 @@ bool OriginCam::decodeTIFF(const std::vector<uint8_t> &imageData)
 
             uint16_t v;
             if ((y & 1) == 0)
-                v = ((x & 1) == 0) ? R : G;   // RG
+                v = ((x & 1) == 0) ? R : G;
             else
-                v = ((x & 1) == 0) ? G : B;   // GB
+                v = ((x & 1) == 0) ? G : B;
 
             monoFrame[(size_t)y * width + x] = v;
         }
@@ -980,8 +787,7 @@ bool OriginCam::decodeTIFF(const std::vector<uint8_t> &imageData)
     return true;
 }
 
-// -------------------- Discovery implementation --------------------
-
+// Discovery implementation (unchanged)
 bool OriginCam::discoverTelescope()
 {
     if (!startDiscovery()) {
@@ -1001,22 +807,13 @@ bool OriginCam::discoverTelescope()
     }
 
     stopDiscovery();
-    logStream(MESSAGE_ERROR) << "Discovery timeout after 30 seconds" << sendLog;
     return false;
 }
 
 bool OriginCam::startDiscovery()
 {
-    logStream(MESSAGE_INFO) << "Starting UDP discovery on port 55555..." << sendLog;
-
-    if (discoverySocket >= 0) {
-        close(discoverySocket);
-        discoverySocket = -1;
-    }
-
     discoverySocket = socket(AF_INET, SOCK_DGRAM, 0);
     if (discoverySocket < 0) {
-        logStream(MESSAGE_ERROR) << "Failed to create UDP socket: " << strerror(errno) << sendLog;
         return false;
     }
 
@@ -1025,9 +822,6 @@ bool OriginCam::startDiscovery()
 
     int reuse = 1;
     setsockopt(discoverySocket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-#ifdef SO_REUSEPORT
-    setsockopt(discoverySocket, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
-#endif
 
     int broadcast = 1;
     setsockopt(discoverySocket, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
@@ -1039,16 +833,12 @@ bool OriginCam::startDiscovery()
     addr.sin_port = htons(55555);
 
     if (bind(discoverySocket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        logStream(MESSAGE_ERROR) << "Failed to bind to port 55555: " << strerror(errno) << sendLog;
         close(discoverySocket);
         discoverySocket = -1;
         return false;
     }
 
     discovering = true;
-    discoveryStartTime = time(nullptr);
-    logStream(MESSAGE_INFO) << "Listening for telescope broadcasts..." << sendLog;
-
     return true;
 }
 
@@ -1078,10 +868,8 @@ void OriginCam::pollDiscovery()
         if (bytesRead < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
-            } else {
-                logStream(MESSAGE_ERROR) << "recvfrom error: " << strerror(errno) << sendLog;
-                break;
             }
+            break;
         }
 
         if (bytesRead == 0) {
@@ -1097,50 +885,20 @@ void OriginCam::pollDiscovery()
         if (datagram.find("Origin") != std::string::npos &&
             datagram.find("IP Address") != std::string::npos) {
 
-            std::string extractedIP;
-            size_t pos = 0;
-            while ((pos = datagram.find('.', pos)) != std::string::npos) {
-                size_t start = datagram.rfind(' ', pos);
-                if (start == std::string::npos) start = 0;
-                else start++;
-
-                size_t end = datagram.find(' ', pos);
-                if (end == std::string::npos) end = datagram.length();
-
-                std::string candidate = datagram.substr(start, end - start);
-
-                if (std::count(candidate.begin(), candidate.end(), '.') == 3) {
-                    extractedIP = candidate;
-                    break;
-                }
-                pos++;
-            }
-
-            if (extractedIP.empty()) {
-                extractedIP = sender_ip;
-            }
-
-            logStream(MESSAGE_INFO) << "Discovered Celestron Origin at " << extractedIP << sendLog;
-            telescopeHost = extractedIP;
+            telescopeHost = sender_ip;
             return;
         }
     }
 }
 
-// -------------------- HTTP download (unchanged, but kept self-contained) --------------------
-
-std::vector<uint8_t>
-OriginCam::downloadImageSync(const std::string &url)
+// HTTP download (unchanged)
+std::vector<uint8_t> OriginCam::downloadImageSync(const std::string &url)
 {
     std::vector<uint8_t> result;
 
-    // Parse URL: http://host[:port]/path
     std::string proto = "http://";
     if (url.rfind(proto, 0) != 0)
-    {
-        std::cerr << "Invalid URL (not http): " << url << std::endl;
         return result;
-    }
 
     std::string rest = url.substr(proto.size());
     std::string host;
@@ -1167,21 +925,16 @@ OriginCam::downloadImageSync(const std::string &url)
 
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0)
-    {
-        perror("socket");
         return result;
-    }
 
     struct timeval timeout;
     timeout.tv_sec = 60;
     timeout.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
     struct hostent *server = gethostbyname(host.c_str());
     if (!server)
     {
-        std::cerr << "gethostbyname failed for " << host << std::endl;
         close(sock);
         return result;
     }
@@ -1193,7 +946,6 @@ OriginCam::downloadImageSync(const std::string &url)
 
     if (connect(sock, reinterpret_cast<struct sockaddr *>(&serv_addr), sizeof(serv_addr)) < 0)
     {
-        perror("connect");
         close(sock);
         return result;
     }
@@ -1205,7 +957,6 @@ OriginCam::downloadImageSync(const std::string &url)
 
     if (send(sock, request.c_str(), request.size(), 0) < 0)
     {
-        perror("send");
         close(sock);
         return result;
     }
@@ -1223,26 +974,20 @@ OriginCam::downloadImageSync(const std::string &url)
             break;
         } else {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // timeout
                 break;
             }
-            perror("recv");
             break;
         }
     }
 
     close(sock);
 
-    // Strip HTTP headers
     const std::string headerSep = "\r\n\r\n";
     auto it = std::search(response.begin(), response.end(),
                           headerSep.begin(), headerSep.end());
 
     if (it == response.end())
-    {
-        std::cerr << "HTTP header not found\n";
         return result;
-    }
 
     it += (ptrdiff_t)headerSep.size();
     result.assign(it, response.end());
@@ -1269,11 +1014,8 @@ int OriginCam::commandAuthorized(rts2core::Connection *conn)
     return Camera::commandAuthorized(conn);
 }
 
-// Main entry point
 int main(int argc, char **argv)
 {
     OriginCam device(argc, argv);
     return device.run();
 }
-
-

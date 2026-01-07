@@ -1,10 +1,10 @@
 /*
- * Celestron Origin Camera Driver for RTS2
+ * Celestron Origin Camera Driver for RTS2 - Connect-on-Demand Version
  *
- * Header updated to match the new snapshot-latch based camera driver:
- *  - No imageReady flag
- *  - Explicit snapshot latch state
- *  - Thread-safe separation between WebSocket RX and RTS2 readout
+ * Key changes:
+ *  - No persistent WebSocket connection
+ *  - Connects only during exposures
+ *  - Snapshot latch for TIFF-only processing
  */
 
 #ifndef __RTS2_ORIGIN_CAMD_H__
@@ -14,7 +14,6 @@
 
 #include <string>
 #include <vector>
-#include <thread>
 #include <atomic>
 #include <mutex>
 #include <tiffio.h>
@@ -45,6 +44,7 @@ protected:
     int processOption(int opt) override;
     int initHardware() override;
     int initChips() override;
+    int initValues() override;
     int info() override;
 
     int startExposure() override;
@@ -56,16 +56,11 @@ protected:
     int switchCooling(bool cooling) override;
 
     int commandAuthorized(rts2core::Connection *conn) override;
-    virtual int initValues() override;
 
 private:
     std::vector<uint16_t> monoFrame;   // decoded RGGB image
-    // ---------------- Threading ----------------
-    std::thread pollThread;
-    std::atomic<bool> pollRunning{false};
-    void pollLoop();
 
-    // ---------------- Connection ----------------
+    // ---------------- Connection (NEW: on-demand) ----------------
     std::string telescopeHost;
     int telescopePort{80};
     bool useDiscovery{false};
@@ -100,7 +95,7 @@ private:
     std::vector<uint8_t> downloadImageSync(const std::string &url);
     bool writeFITSforRTS2(const char *filename);
 
-    // ---------------- WebSocket protocol ----------------
+    // ---------------- WebSocket protocol (NEW: on-demand) ----------------
     bool connectToTelescope();
     void disconnectFromTelescope();
 
@@ -134,4 +129,3 @@ private:
 } // namespace rts2camd
 
 #endif // __RTS2_ORIGIN_CAMD_H__
-
