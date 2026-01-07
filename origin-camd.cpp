@@ -560,34 +560,39 @@ int OriginCam::doReadout()
 
     exposureInProgress = false;
 
-    // Create FITS filename
+    // Validate data
+    if (monoFrame.empty()) {
+        VLOG(MESSAGE_ERROR) << "doReadout(): monoFrame is empty" << sendLog;
+        return -1;
+    }
+
+    // Generate filename
     time_t now = time(nullptr);
     struct tm *tm_info = gmtime(&now);
     char filename[256];
-    snprintf(filename, sizeof(filename), 
+    snprintf(filename, sizeof(filename),
              "/home/jonathan/data/images/ORIGIN_CAM_%04d%02d%02d_%02d%02d%02d.fits",
              tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
              tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
 
-    // Write FITS file directly
-    if (!writeFITS(filename)) {
+    // ✅ Write FITS using RTS2's method (like dummy camera)
+    if (!writeFITSforRTS2(filename)) {
         VLOG(MESSAGE_ERROR) << "Failed to write FITS: " << filename << sendLog;
         return -1;
     }
 
-    VLOG(MESSAGE_INFO) << "doReadout(): FITS file written to " << filename << sendLog;
-
+    // ✅ Tell RTS2/imgproc about the file
+    VLOG(MESSAGE_INFO) << "Calling fitsDataTransfer for: " << filename << sendLog;
     int ret = fitsDataTransfer(filename);
     VLOG(MESSAGE_INFO) << "fitsDataTransfer returned: " << ret << sendLog;
 
-    return -2;
+    return -2;  // Readout complete
 }
 
-bool OriginCam::writeFITS(const char *filename)
+bool OriginCam::writeFITSforRTS2(const char *filename)
 {
     fitsfile *fptr;
     int status = 0;
-    long naxis = 2;
     long naxes[2] = {3056, 2048};
 
     // Create FITS file
@@ -598,16 +603,16 @@ bool OriginCam::writeFITS(const char *filename)
     }
 
     // Create image HDU
-    fits_create_img(fptr, USHORT_IMG, naxis, naxes, &status);
+    fits_create_img(fptr, USHORT_IMG, 2, naxes, &status);
     if (status) {
         VLOG(MESSAGE_ERROR) << "fits_create_img failed: " << status << sendLog;
         fits_close_file(fptr, &status);
         return false;
     }
 
-    // Write image data
-    fits_write_img(fptr, TUSHORT, 1, monoFrame.size(), 
-                   monoFrame.data(), &status);
+    // Write image data (like dummy camera does)
+    fits_write_img(fptr, TUSHORT, 1, monoFrame.size(),
+                   (uint16_t*)monoFrame.data(), &status);
     if (status) {
         VLOG(MESSAGE_ERROR) << "fits_write_img failed: " << status << sendLog;
         fits_close_file(fptr, &status);
@@ -615,25 +620,23 @@ bool OriginCam::writeFITS(const char *filename)
     }
 
     // Add basic keywords
-    fits_update_key(fptr, TSTRING, "INSTRUME", (void*)"ORIGIN_CAM", 
+    char instrume[] = "ORIGIN_CAM";
+    fits_update_key(fptr, TSTRING, "INSTRUME", instrume,
                     "Camera name", &status);
-    
-    // ✅ Fix: store value in variable first
+
     double exptime = exposureDuration;
-    fits_update_key(fptr, TDOUBLE, "EXPTIME", &exptime, 
+    fits_update_key(fptr, TDOUBLE, "EXPTIME", &exptime,
                     "Exposure time", &status);
-    
-    // ✅ Fix: store gain in variable first
+
     int gainval = gain->getValueInteger();
-    fits_update_key(fptr, TINT, "GAIN", &gainval, 
+    fits_update_key(fptr, TINT, "GAIN", &gainval,
                     "ISO/Gain", &status);
-    
-    // Add more useful keywords
+
     int binx = binningHorizontal();
     int biny = binningVertical();
     fits_update_key(fptr, TINT, "XBINNING", &binx, "Horizontal binning", &status);
     fits_update_key(fptr, TINT, "YBINNING", &biny, "Vertical binning", &status);
-    
+
     // Add timestamp
     char dateobs[32];
     time_t now = time(nullptr);
@@ -641,16 +644,18 @@ bool OriginCam::writeFITS(const char *filename)
     snprintf(dateobs, sizeof(dateobs), "%04d-%02d-%02dT%02d:%02d:%02d",
              tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
              tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
-    fits_update_key(fptr, TSTRING, "DATE-OBS", dateobs, "UTC date/time of observation", &status);
+    fits_update_key(fptr, TSTRING, "DATE-OBS", dateobs,
+                    "UTC date/time of observation", &status);
 
     // Close file
     fits_close_file(fptr, &status);
 
     if (status) {
-        VLOG(MESSAGE_ERROR) << "fits_close_file failed: " << status << sendLog;
+        VLOG(MESSAGE_ERROR) << "FITS write completed with errors: " << status << sendLog;
         return false;
     }
 
+    VLOG(MESSAGE_INFO) << "FITS file written successfully: " << filename << sendLog;
     return true;
 }
 

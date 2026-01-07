@@ -98,7 +98,7 @@ private:
 
     bool decodeTIFF(const std::vector<uint8_t> &imageData);
     std::vector<uint8_t> downloadImageSync(const std::string &url);
-    bool writeFITS(const char *filename);
+    bool writeFITSforRTS2(const char *filename);
 
     // ---------------- WebSocket protocol ----------------
     bool connectToTelescope();
