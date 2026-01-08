@@ -39,66 +39,112 @@ static inline double deg2rad(double d) { return d * M_PI / 180.0; }
 
 static inline bool finite2(double a, double b) { return std::isfinite(a) && std::isfinite(b); }
 
-// Simple JSON parser
+// Simple JSON-ish parser (tolerates: " or ' quotes, , or ; separators)
+// It is NOT a full JSON parser; it's aimed at Origin's frames.
 class SimpleJSON {
 public:
-	static bool isNullLike(const std::string& v)
-{
-    if (v.empty()) return true;
-    if (v == "null") return true;
-    if (v == "NaN") return true;
-    if (v == "nan") return true;
-    return false;
-}
-    static std::map<std::string, std::string> parse(const std::string& json) {
-        std::map<std::string, std::string> result;
-        size_t pos = 0;
-        while ((pos = json.find("\"", pos)) != std::string::npos) {
-            size_t keyStart = pos + 1;
-            size_t keyEnd = json.find("\"", keyStart);
-            if (keyEnd == std::string::npos) break;
-            
-            std::string key = json.substr(keyStart, keyEnd - keyStart);
-            
-            size_t colonPos = json.find(":", keyEnd);
-            if (colonPos == std::string::npos) break;
-            
-            size_t valueStart = colonPos + 1;
-            while (valueStart < json.length() && 
-                   (json[valueStart] == ' ' || json[valueStart] == '\t')) {
-                valueStart++;
-            }
-            
-            std::string value;
-            if (valueStart < json.size() && json[valueStart] == '\"') {
-                size_t valueEnd = json.find("\"", valueStart + 1);
-                if (valueEnd != std::string::npos) {
-                    value = json.substr(valueStart + 1, valueEnd - valueStart - 1);
-                    pos = valueEnd + 1;
-                } else {
-                    break;
-                }
-            } else {
-                size_t valueEnd = json.find_first_of(",}", valueStart);
-                if (valueEnd != std::string::npos) {
-                    value = json.substr(valueStart, valueEnd - valueStart);
-                    size_t end = value.find_last_not_of(" \t\r\n");
-                    if (end != std::string::npos)
-                        value = value.substr(0, end + 1);
-                    else
-                        value.clear();
-                    pos = valueEnd;
-                } else {
-                    break;
-                }
-            }
-            
-            result[key] = value;
-        }
-        return result;
+    static bool isNullLike(const std::string& v)
+    {
+        if (v.empty()) return true;
+        if (v == "null" || v == "NULL") return true;
+        if (v == "NaN" || v == "nan") return true;
+        return false;
     }
-    
-    static std::string create(const std::map<std::string, std::string>& data) {
+
+    static std::map<std::string, std::string> parse(const std::string& s)
+    {
+        std::map<std::string, std::string> out;
+
+        auto is_ws = [](char c){ return c==' '||c=='\t'||c=='\r'||c=='\n'; };
+
+        size_t i = 0;
+        const size_t n = s.size();
+
+        auto skip_ws = [&](){
+            while (i < n && is_ws(s[i])) i++;
+        };
+
+        auto skip_seps = [&](){
+            while (i < n) {
+                char c = s[i];
+                if (is_ws(c) || c==',' || c==';') { i++; continue; }
+                break;
+            }
+        };
+
+        auto parse_quoted = [&](char quote) -> std::string {
+            std::string r;
+            // assumes s[i] == quote
+            i++; // skip opening quote
+            while (i < n) {
+                char c = s[i++];
+                if (c == '\\' && i < n) {
+                    // keep escapes minimally (enough for numbers/keys)
+                    r.push_back(s[i++]);
+                    continue;
+                }
+                if (c == quote) break;
+                r.push_back(c);
+            }
+            return r;
+        };
+
+        auto parse_bare = [&]() -> std::string {
+            size_t start = i;
+            while (i < n) {
+                char c = s[i];
+                if (c==',' || c==';' || c=='}' || c=='\n' || c=='\r') break;
+                i++;
+            }
+            // trim trailing ws
+            size_t end = i;
+            while (end > start && is_ws(s[end-1])) end--;
+            return s.substr(start, end - start);
+        };
+
+        while (i < n) {
+            skip_seps();
+            skip_ws();
+            if (i >= n) break;
+
+            // we only accept keys that start with quote ' or "
+            if (s[i] != '"' && s[i] != '\'') {
+                // advance to next likely key
+                i++;
+                continue;
+            }
+
+            char qk = s[i];
+            std::string key = parse_quoted(qk);
+
+            skip_ws();
+            if (i >= n) break;
+
+            // accept : or = between key and value
+            if (s[i] == ':' || s[i] == '=') i++;
+            skip_ws();
+            if (i >= n) break;
+
+            std::string val;
+            if (s[i] == '"' || s[i] == '\'') {
+                char qv = s[i];
+                val = parse_quoted(qv);
+            } else {
+                val = parse_bare();
+            }
+
+            out[key] = val;
+
+            // consume until separator / end of object
+            while (i < n && s[i] != ',' && s[i] != ';' && s[i] != '}') i++;
+            if (i < n && (s[i] == ',' || s[i] == ';')) i++;
+        }
+
+        return out;
+    }
+
+    static std::string create(const std::map<std::string, std::string>& data)
+    {
         std::ostringstream json;
         json << "{";
         bool first = true;
@@ -268,9 +314,14 @@ int Origin::initHardware()
 int Origin::info()
 {
     time_t now = time(nullptr);
-    
+
+    // If we don't have a valid site yet, we must stay connected long enough
+    // to learn it (either from RTS2/centrald or from the mount status frames).
+    bool needSite = !siteLocationSet;
+
     // If we have an active operation or recent status, stay connected
-    if (operationActive || (now - lastStatusUpdate < 5)) {
+    bool slewing = gotoInProgress || status->isSlewing;
+    if (needSite || operationActive || slewing || (now - lastStatusUpdate < 5)) {
         ensureConnected();
         pollMessages();
     } else {
@@ -280,13 +331,13 @@ int Origin::info()
             disconnectFromTelescope();
         }
     }
-    
-    if (!siteLocationSet || !status->isAligned)
+
+    // Don’t let RTS2 do horizon math until site is known.
+    if (!siteLocationSet)
         return 0;
 
     if (status->lastUpdate > 0) {
         isAligned->setValueBool(status->isAligned);
-        // tracking status is managed by base Telescope class
         batteryVoltage->setValueDouble(status->batteryVoltage);
     }
 
@@ -308,15 +359,12 @@ void Origin::valueChanged(rts2core::Value *changed_value)
 
     if (changed_value == telTargetRaDec)
     {
-        double ra  = telTargetRaDec->getRa();
-        double dec = telTargetRaDec->getDec();
+        // This is typically used for sync/corrections, not a physical slew.
+        double raDeg  = telTargetRaDec->getRa();   // degrees
+        double decDeg = telTargetRaDec->getDec();  // degrees
 
-        logStream(MESSAGE_INFO)
-            << "tel_target updated: RA=" << ra << " DEC=" << dec
-            << sendLog;
-
-        double ra_rad  = deg2rad(ra);
-        double dec_rad = deg2rad(dec);
+        double ra_rad  = deg2rad(raDeg);
+        double dec_rad = deg2rad(decDeg);
 
         std::ostringstream params;
         params << "{"
@@ -325,7 +373,12 @@ void Origin::valueChanged(rts2core::Value *changed_value)
                << "}";
 
         ensureConnected();
-        sendCommand("GotoRaDec", "Mount", params.str());
+        sendCommand("SyncToRaDec", "Mount", params.str());
+        lastStatusUpdate = time(nullptr);
+
+        logStream(MESSAGE_INFO)
+            << "SyncToRaDec sent from tel_target update: RA=" << (raDeg/15.0) << "h DEC=" << decDeg << "°"
+            << sendLog;
     }
 }
 
@@ -511,26 +564,27 @@ bool Origin::connectToTelescope()
         delete webSocket;
         webSocket = nullptr;
     }
-    
+
     webSocket = new OriginWebSocket();
-    
-    logStream(MESSAGE_INFO) << "Connecting to telescope at " 
-                           << telescopeHost << ":" << telescopePort << sendLog;
-    
+
+    logStream(MESSAGE_INFO) << "Connecting to telescope at "
+                            << telescopeHost << ":" << telescopePort << sendLog;
+
     if (!webSocket->connect(telescopeHost, telescopePort, "/SmartScope-1.0/mountControlEndpoint")) {
         logStream(MESSAGE_ERROR) << "WebSocket connection failed" << sendLog;
         delete webSocket;
         webSocket = nullptr;
+        connected = false;
         return false;
     }
-    
+
     connected = true;
-    
-    // Request initial status
+
+    // Request initial status right away (site/align often arrives here)
     sendCommand("GetStatus", "Mount");
-    
+    lastStatusUpdate = time(nullptr);
+
     logStream(MESSAGE_INFO) << "Connected to telescope" << sendLog;
-    
     return true;
 }
 
@@ -651,110 +705,130 @@ void Origin::processMessage(const std::string& message)
 void Origin::updateTelescopeStatus(const std::string& jsonData)
 {
     static bool alignmentAnnounced = false;
-    static bool siteAnnounced = false;
     static bool skyCoordsAnnounced = false;
+    static bool siteSourceLogged = false; // log site source once
+
     auto data = SimpleJSON::parse(jsonData);
-    if (!status->isAligned) {
-    have_valid_altaz = false;
-    }
 
     auto getD = [&](const char* k, double& out) -> bool {
-    auto it = data.find(k);
-    if (it == data.end())
-        return false;
+        auto it = data.find(k);
+        if (it == data.end())
+            return false;
 
-    if (SimpleJSON::isNullLike(it->second))
-        return false;
+        if (SimpleJSON::isNullLike(it->second))
+            return false;
 
-    try {
-        out = std::stod(it->second);
-        return std::isfinite(out);
-    } catch (...) {
-        return false;
-    }
-};
-
-    double altRad = NAN, azmRad = NAN;
-    bool haveAlt = getD("Alt", altRad);
-    bool haveAzm = getD("Azm", azmRad);
-    if (haveAlt && haveAzm) {
-        status->altitude = altRad;
-        status->azimuth = azmRad;
-        have_valid_altaz = true;
+        try {
+            out = std::stod(it->second);
+            return std::isfinite(out);
+        } catch (...) {
+            return false;
         }
-else {
-    have_valid_altaz = false;
-}
+    };
 
-    double raRad = NAN, decRad = NAN;
-    bool haveRa = getD("Ra", raRad);
-    bool haveDec = getD("Dec", decRad);
-    if (haveRa && haveDec && status->isAligned) {
-    status->raPosition = raRad;
-    status->decPosition = decRad;
+    // --- Alignment flag first ---
+    bool alignedNow = status->isAligned;
+    auto itAligned = data.find("IsAligned");
+    if (itAligned != data.end())
+        alignedNow = (itAligned->second == "true" || itAligned->second == "1");
 
-    double ra_deg = rad2deg(raRad);
-    double dec_deg = rad2deg(decRad);
-
-    setTelRaDec(ra_deg / 15.0, dec_deg);
-
-    if (!skyCoordsAnnounced) {
-        logStream(MESSAGE_INFO)
-            << "Sky coordinates locked: RA="
-            << (ra_deg / 15.0)
-            << "h DEC="
-            << dec_deg
-            << "°"
-            << sendLog;
-        skyCoordsAnnounced = true;
-    }
-}
-
-    double latRad, lonRad;
-    bool haveLat = getD("Latitude", latRad);
-    bool haveLon = getD("Longitude", lonRad);
-
-    if (haveLat && haveLon && !siteLocationSet) {
-    double latDeg = rad2deg(latRad);
-    double lonDeg = rad2deg(lonRad);
-
-    setTelLongLat(lonDeg, latDeg);
-    setTelAltitude(50.0);
-    siteLocationSet = true;
-
-    logStream(MESSAGE_INFO)
-        << "Site location received from mount: lat="
-        << latDeg << " lon=" << lonDeg
-        << sendLog;
-
-    logStream(MESSAGE_INFO)
-        << "RTS2 telescope site initialised"
-        << sendLog;
-    }
-
-    bool alignedNow = false;
-    if (data.find("IsAligned") != data.end())
-    alignedNow = (data["IsAligned"] == "true");
-
+    // Detect rising edge of alignment
     if (alignedNow && !status->isAligned && !alignmentAnnounced) {
-    logStream(MESSAGE_INFO)
-        << "Mount alignment complete — sky model is now valid"
-        << sendLog;
-    setTracking(1, false, true);
-    alignmentAnnounced = true;
-    }
+        logStream(MESSAGE_INFO)
+            << "Mount alignment complete — sky model is now valid"
+            << sendLog;
 
+        // enable tracking in RTS2 only once alignment is valid
+        setTracking(1, false, true);
+
+        alignmentAnnounced = true;
+    }
     status->isAligned = alignedNow;
 
-    if (data.find("IsTracking") != data.end())
-        status->isTracking = (data["IsTracking"] == "true");
+    // --- Try to resolve SITE from RTS2 first (centrald) ---
+    // NOTE: getLatitude/getLongitude return degrees in RTS2.
+    // If they are NaN, centrald hasn't provided them (or driver isn't registered yet).
+    if (!siteLocationSet) {
+        double latDeg = getLatitude();
+        double lonDeg = getLongitude();
 
-    if (data.find("IsGotoOver") != data.end())
-        status->isSlewing = (data["IsGotoOver"] == "false");
+        if (std::isfinite(latDeg) && std::isfinite(lonDeg)) {
+            siteLocationSet = true;
+            if (!siteSourceLogged) {
+                logStream(MESSAGE_INFO)
+                    << "Using RTS2 site configuration: lat=" << latDeg
+                    << " lon=" << lonDeg
+                    << sendLog;
+                siteSourceLogged = true;
+            }
+        }
+    }
 
-    if (data.find("BatteryVoltage") != data.end()) {
-        try { status->batteryVoltage = std::stod(data["BatteryVoltage"]); }
-        catch (...) {}
+    // --- If RTS2 site still unknown, fall back to mount-provided Latitude/Longitude (radians) ---
+    if (!siteLocationSet) {
+        double latRad = NAN, lonRad = NAN;
+        bool haveLat = getD("Latitude", latRad);
+        bool haveLon = getD("Longitude", lonRad);
+
+        if (haveLat && haveLon) {
+            double latDeg = rad2deg(latRad);
+            double lonDeg = rad2deg(lonRad);
+
+            setTelLongLat(lonDeg, latDeg);
+            setTelAltitude(50.0);
+
+            siteLocationSet = true;
+
+            logStream(MESSAGE_WARNING)
+                << "Using site location from mount (RTS2 site unavailable): lat="
+                << latDeg << " lon=" << lonDeg
+                << sendLog;
+
+            siteSourceLogged = true;
+        }
+    }
+
+    // --- Update RA/Dec only when aligned (your good idea) ---
+    // RA/Dec in mount messages are radians.
+    double raRad = NAN, decRad = NAN;
+    if (status->isAligned && getD("Ra", raRad) && getD("Dec", decRad)) {
+        status->raPosition  = raRad;
+        status->decPosition = decRad;
+
+        double ra_deg  = rad2deg(raRad);
+        double dec_deg = rad2deg(decRad);
+
+        setTelRaDec(ra_deg / 15.0, dec_deg);
+
+        if (!skyCoordsAnnounced) {
+            logStream(MESSAGE_INFO)
+                << "Sky coordinates locked: RA=" << (ra_deg / 15.0)
+                << "h DEC=" << dec_deg << "°"
+                << sendLog;
+            skyCoordsAnnounced = true;
+        }
+    }
+
+    // --- Optional Alt/Az capture (do not drive the model from it) ---
+    // Keep it for diagnostics; do not gate horizon on it.
+    double altRad = NAN, azmRad = NAN;
+    if (getD("Alt", altRad) && getD("Azm", azmRad)) {
+        status->altitude = altRad;
+        status->azimuth  = azmRad;
+    }
+
+    // --- Other flags ---
+    auto itTracking = data.find("IsTracking");
+    if (itTracking != data.end())
+        status->isTracking = (itTracking->second == "true" || itTracking->second == "1");
+
+    auto itGotoOver = data.find("IsGotoOver");
+    if (itGotoOver != data.end())
+        status->isSlewing = (itGotoOver->second == "false" || itGotoOver->second == "0");
+
+    auto itBat = data.find("BatteryVoltage");
+    if (itBat != data.end()) {
+        try { status->batteryVoltage = std::stod(itBat->second); } catch (...) {}
     }
 
     status->lastUpdate = time(nullptr);
