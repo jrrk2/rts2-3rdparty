@@ -340,17 +340,15 @@ Images are downloaded via HTTP:
 ## Coordinate Systems
 
 - **RTS2 uses J2000.0** coordinates internally
-- **Origin mount uses JNow** coordinates
+- **Origin mount uses J2000** coordinates
 - Drivers automatically handle precession using libnova
 
 ## Troubleshooting
 
-### Connection Issues
+This driver does not handle initialisation, this should be done
+by the OriginApp or using a utility such as OriginMonitor (available in source form)
 
-1. **Check network connectivity:**
-   ```bash
-   ping 192.168.1.100
-   ```
+### Connection Issues
 
 2. **Verify WebSocket connection:**
    ```bash
