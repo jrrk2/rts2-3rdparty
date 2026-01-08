@@ -245,6 +245,19 @@ int Origin::initHardware()
         return -1;
     }
     
+    if (getLatitude() != 0.0 || getLongitude() != 0.0) {
+    siteLocationSet = true;
+
+    logStream(MESSAGE_INFO)
+        << "Centrald connected: "
+        << (connected ? "YES" : "NO")
+        << ", using RTS2 site configuration: lat="
+        << getLatitude()
+        << " lon="
+        << getLongitude()
+        << sendLog;
+    }
+
     // Don't connect here - connect on demand
     logStream(MESSAGE_INFO) << "Origin telescope initialized (connect-on-demand mode)" << sendLog;
     logStream(MESSAGE_INFO) << "Ready to accept commands" << sendLog;
