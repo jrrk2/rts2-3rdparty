@@ -185,6 +185,8 @@ void OriginWebSocket::disconnect()
         m_socket = -1;
     }
     m_connected = false;
+    m_messageBuffer.clear();
+    m_receivingMessage = false;
 }
 
 bool OriginWebSocket::sendText(const std::string& message)
@@ -245,67 +247,102 @@ std::string OriginWebSocket::receiveText()
     if (!m_connected || !hasData()) {
         return "";
     }
-    
-    unsigned char header[2];
-    ssize_t received = recv(m_socket, header, 2, 0);
-    
-    if (received != 2) {
-        return "";
-    }
-    
-    // bool fin = (header[0] & 0x80) != 0;  // Not used in current implementation
-    int opcode = header[0] & 0x0F;
-    bool masked = (header[1] & 0x80) != 0;
-    uint64_t payload_len = header[1] & 0x7F;
-    
-    // Handle extended payload length
-    if (payload_len == 126) {
-        unsigned char len_bytes[2];
-        if (recv(m_socket, len_bytes, 2, 0) != 2) return "";
-        payload_len = (len_bytes[0] << 8) | len_bytes[1];
-    } else if (payload_len == 127) {
-        unsigned char len_bytes[8];
-        if (recv(m_socket, len_bytes, 8, 0) != 8) return "";
-        payload_len = 0;
-        for (int i = 0; i < 8; i++) {
-            payload_len = (payload_len << 8) | len_bytes[i];
+
+    while (true) {
+        unsigned char header[2];
+        ssize_t received = recv(m_socket, header, 2, 0);
+        if (received != 2) {
+            return "";
         }
-    }
-    
-    // Read mask key if present
-    unsigned char mask[4] = {0};
-    if (masked) {
-        if (recv(m_socket, mask, 4, 0) != 4) return "";
-    }
-    
-    // Read payload
-    std::vector<unsigned char> payload(payload_len);
-    size_t total_received = 0;
-    
-    while (total_received < payload_len) {
-        ssize_t n = recv(m_socket, payload.data() + total_received, 
-                        payload_len - total_received, 0);
-        if (n <= 0) break;
-        total_received += n;
-    }
-    
-    // Unmask if needed
-    if (masked) {
-        for (size_t i = 0; i < payload_len; i++) {
-            payload[i] ^= mask[i % 4];
+
+        bool fin = (header[0] & 0x80) != 0;
+        uint8_t opcode = header[0] & 0x0F;
+        bool masked = (header[1] & 0x80) != 0;
+        uint64_t payload_len = header[1] & 0x7F;
+
+        // Extended payload length
+        if (payload_len == 126) {
+            unsigned char len_bytes[2];
+            if (recv(m_socket, len_bytes, 2, 0) != 2) return "";
+            payload_len = (len_bytes[0] << 8) | len_bytes[1];
+        } else if (payload_len == 127) {
+            unsigned char len_bytes[8];
+            if (recv(m_socket, len_bytes, 8, 0) != 8) return "";
+            payload_len = 0;
+            for (int i = 0; i < 8; i++) {
+                payload_len = (payload_len << 8) | len_bytes[i];
+            }
         }
+
+        // Mask key (server frames are normally unmasked, but handle anyway)
+        unsigned char mask[4] = {0};
+        if (masked) {
+            if (recv(m_socket, mask, 4, 0) != 4) return "";
+        }
+
+        // Read payload
+        std::vector<unsigned char> payload(payload_len);
+        size_t total_received = 0;
+        while (total_received < payload_len) {
+            ssize_t n = recv(
+                m_socket,
+                payload.data() + total_received,
+                payload_len - total_received,
+                0
+            );
+            if (n <= 0) {
+                return "";
+            }
+            total_received += n;
+        }
+
+        // Unmask payload if needed
+        if (masked) {
+            for (size_t i = 0; i < payload_len; i++) {
+                payload[i] ^= mask[i % 4];
+            }
+        }
+
+        // -----------------------------
+        // WebSocket message reassembly
+        // -----------------------------
+
+        if (opcode == 0x1) {  // TEXT (start of message)
+            m_messageBuffer.assign(payload.begin(), payload.end());
+            m_messageOpcode = opcode;
+            m_receivingMessage = !fin;
+
+            if (fin) {
+                return m_messageBuffer;  // complete message in one frame
+            }
+        }
+        else if (opcode == 0x0) {  // CONTINUATION
+            if (!m_receivingMessage) {
+                // Protocol error or desync: ignore
+                continue;
+            }
+
+            m_messageBuffer.append(payload.begin(), payload.end());
+
+            if (fin) {
+                m_receivingMessage = false;
+                return m_messageBuffer;  // COMPLETE MESSAGE
+            }
+        }
+        else if (opcode == 0x8) {  // CLOSE
+            m_connected = false;
+            return "";
+        }
+        else if (opcode == 0x9) {  // PING
+            // Respond with PONG
+            unsigned char pong[] = {0x8A, 0x00};
+            send(m_socket, pong, 2, 0);
+        }
+        else if (opcode == 0xA) {  // PONG
+            // Ignore
+        }
+
+        // Otherwise: loop again until a complete message is assembled
     }
-    
-    // Handle opcodes
-    if (opcode == 0x1) {  // Text frame
-        return std::string(payload.begin(), payload.end());
-    } else if (opcode == 0x8) {  // Close frame
-        m_connected = false;
-    } else if (opcode == 0x9) {  // Ping
-        // Send pong
-        unsigned char pong[] = {0x8A, 0x00};  // FIN + Pong
-        send(m_socket, pong, 2, 0);
-    }
-    
-    return "";
 }
+

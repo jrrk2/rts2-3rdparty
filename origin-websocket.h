@@ -8,6 +8,7 @@
 
 #include <string>
 #include <functional>
+#include <cstdint>
 
 class OriginWebSocket
 {
@@ -30,6 +31,11 @@ private:
     int m_socket;
     bool m_connected;
     
+    // --- WebSocket message reassembly state ---
+    std::string m_messageBuffer;
+    bool m_receivingMessage = false;
+    uint8_t m_messageOpcode = 0;
+
     bool doHandshake(const std::string& host, const std::string& path);
 };
 

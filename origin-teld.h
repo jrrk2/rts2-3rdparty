@@ -26,6 +26,7 @@ public:
 protected:
     virtual int processOption(int opt);
     virtual int initHardware();
+    virtual int initValues();
     virtual int info();
 
     virtual bool needInfo();
@@ -64,6 +65,7 @@ private:
     bool gotoInProgress;
     bool siteLocationSet;
     bool raDecSet;
+    bool have_valid_altaz = false;
 
     // Discovery state
     int discoverySocket;
@@ -73,7 +75,7 @@ private:
     // RTS2 values
     rts2core::ValueString *telescopeAddress;
     rts2core::ValueBool *isAligned;
-    rts2core::ValueBool *trackingEnabled;
+    // tracking value is created by base Telescope class
     rts2core::ValueDouble *batteryVoltage;
     rts2core::ValueDouble *temperature;
 
