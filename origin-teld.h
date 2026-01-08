@@ -32,6 +32,7 @@ protected:
     virtual int initHardware();
     virtual int initValues();
     virtual int info();
+    virtual int idle();
 
     virtual bool needInfo();
     virtual bool isSafe();

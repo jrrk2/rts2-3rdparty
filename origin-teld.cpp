@@ -50,17 +50,6 @@ static inline double rad2deg(double r) { return r * 180.0 / M_PI; }
 static inline double deg2rad(double d) { return d * M_PI / 180.0; }
 static inline bool isfinite_d(double x) { return std::isfinite(x); }
 
-static bool envTruthy(const char* name)
-{
-    const char* v = std::getenv(name);
-    if (!v) return false;
-    if (!*v) return false;
-    if (!strcasecmp(v, "0")) return false;
-    if (!strcasecmp(v, "false")) return false;
-    if (!strcasecmp(v, "no")) return false;
-    return true;
-}
-
 /* -------------------------
  * Permissive "JSON-ish" parser
  *
@@ -319,7 +308,6 @@ Origin::Origin(int argc, char** argv)
     // Lifecycle flags
     initialising = true;            // stay connected until we have site
     siteLocationSet = false;
-    have_valid_altaz = false;
     lastRxTime = 0;
     lastTxTime = 0;
     lastStatusUpdate = 0;
@@ -427,8 +415,21 @@ int Origin::initHardware()
 int Origin::initValues()
 {
     int ret = Telescope::initValues();
-    if (ret) return ret;
-    // Do NOT force tracking here; we will enable when aligned (or when mount says tracking).
+    if (ret)
+        return ret;
+
+    rts2core::Value *v = getValue(getDeviceName(), "IGNORE_HORIZON");
+    if (v)
+    {
+        auto *vb = dynamic_cast<rts2core::ValueBool *>(v);
+        if (vb)
+        {
+            vb->setValueBool(true);
+            sendValueAll(vb);
+            logStream(MESSAGE_INFO) << "IGNORE_HORIZON enabled (Origin uses RA/DEC only)";
+        }
+    }
+
     return 0;
 }
 
@@ -460,11 +461,14 @@ void Origin::valueChanged(rts2core::Value* changed_value)
     }
 }
 
+int Origin::idle()
+{
+	updateConnectionPolicy();
+	return Telescope::idle();
+}
+
 int Origin::info()
 {
-    // Always keep a socket during init; after init, keep while active/recent.
-    updateConnectionPolicy();
-
     if (connected) {
         pollMessages(); // drains inbound; also triggers periodic GetStatus
     }
@@ -498,6 +502,7 @@ int Origin::startResync()
            << "}";
 
     operationActive = true;
+    status->isSlewing = true;
     gotoInProgress = true;
     lastActivityTime = time(nullptr);
 
@@ -520,8 +525,6 @@ int Origin::startResync()
 
 int Origin::isMoving()
 {
-    if (!gotoInProgress) return -2;
-
     ensureConnected();
     pollMessages();
 
@@ -529,9 +532,12 @@ int Origin::isMoving()
         return USEC_SEC / 10;
     }
 
-    gotoInProgress = false;
-    operationActive = false;
-    logStream(MESSAGE_INFO) << "Goto complete" << sendLog;
+    if (gotoInProgress) {
+        gotoInProgress = false;
+        operationActive = false;
+        logStream(MESSAGE_INFO) << "Goto complete" << sendLog;
+    }
+
     return -2;
 }
 
@@ -728,9 +734,10 @@ void Origin::pollMessages()
     // - otherwise: modest
     time_t now = time(nullptr);
     int period = (initialising && !siteLocationSet) ? 1 : 2;
-    if (now - lastStatusUpdate >= period) {
-        sendCommand("GetStatus", "Mount");
-        lastStatusUpdate = now;
+    if ((operationActive || gotoInProgress || initialising) && now - lastStatusUpdate >= period) {
+
+    sendCommand("GetStatus", "Mount");
+    lastStatusUpdate = now;
     }
 }
 
@@ -782,48 +789,73 @@ bool Origin::sendCommand(const std::string& command,
  * Message handling & diagnostics
  * ------------------------- */
 
-void Origin::processMessage(const std::string& message)
+static std::vector<std::string> splitJsonObjects(const std::string& s)
 {
-    // For diagnostics: optionally dump every frame from Mount
-    // Note: do NOT spam unless explicitly requested.
-    auto data = SimpleJSON::parse(message);
-    const std::string source  = (data.count("Source")  ? data["Source"]  : "");
-    const std::string command = (data.count("Command") ? data["Command"] : "");
-    const std::string type    = (data.count("Type")    ? data["Type"]    : "");
+    std::vector<std::string> out;
+    int depth = 0;
+    bool inStr = false;
+    char q = 0;
+    size_t start = std::string::npos;
 
-    if (rawFrameLogging && source == "Mount") {
-        logStream(MESSAGE_INFO) << "WS RECV (Mount) raw=" << message << sendLog;
-    } else if (debugEnabled && source == "Mount") {
-        // Light sampling: log only if it looks like it might contain site keys
-        if (message.find("Latitude") != std::string::npos ||
-            message.find("Longitude") != std::string::npos ||
-            message.find("lat") != std::string::npos ||
-            message.find("lon") != std::string::npos) {
-            logStream(MESSAGE_INFO) << "WS RECV (Mount) candidate-site raw=" << message << sendLog;
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+
+        if (inStr) {
+            if (c == '\\') { // skip escaped char
+                if (i + 1 < s.size()) i++;
+                continue;
+            }
+            if (c == q) { inStr = false; q = 0; }
+            continue;
+        } else {
+            if (c == '"' || c == '\'') { inStr = true; q = c; continue; }
+        }
+
+        if (c == '{') {
+            if (depth == 0) start = i;
+            depth++;
+        } else if (c == '}') {
+            if (depth > 0) depth--;
+            if (depth == 0 && start != std::string::npos) {
+                out.emplace_back(s.substr(start, i - start + 1));
+                start = std::string::npos;
+            }
         }
     }
 
-    if (type == "Error" || type == "error") {
-        std::string error_msg = (data.count("Message") ? data["Message"] :
-                                (data.count("ErrorMessage") ? data["ErrorMessage"] : "Unknown error"));
-        logStream(MESSAGE_ERROR)
-            << "Error from " << source << " command=" << command << ": " << error_msg
-            << sendLog;
-        if (debugEnabled) logStream(MESSAGE_DEBUG) << "Full error frame: " << message << sendLog;
-        return;
-    }
+    // If we failed to find balanced objects, fall back to whole string
+    if (out.empty() && s.find('{') != std::string::npos)
+        out.push_back(s);
 
-    if (type == "Warning" || type == "warning") {
-        std::string warn_msg = (data.count("Message") ? data["Message"] : "Unknown warning");
-        logStream(MESSAGE_WARNING)
-            << "Warning from " << source << " command=" << command << ": " << warn_msg
-            << sendLog;
-        return;
-    }
+    return out;
+}
 
-    if (source == "Mount") {
-        updateTelescopeStatus(message);
-        return;
+void Origin::processMessage(const std::string& message)
+{
+    // Split concatenated objects: {...}{...}{...}
+    for (const auto& obj : splitJsonObjects(message)) {
+
+        auto data = SimpleJSON::parse(obj);
+        const std::string source  = (data.count("Source")  ? data["Source"]  : "");
+        const std::string command = (data.count("Command") ? data["Command"] : "");
+        const std::string type    = (data.count("Type")    ? data["Type"]    : "");
+
+        if (rawFrameLogging && source == "Mount") {
+            logStream(MESSAGE_INFO) << "WS RECV (Mount) raw=" << obj << sendLog;
+        }
+
+        if (type == "Error" || type == "error") {
+            std::string error_msg = (data.count("Message") ? data["Message"] :
+                                    (data.count("ErrorMessage") ? data["ErrorMessage"] : "Unknown error"));
+            logStream(MESSAGE_ERROR)
+                << "Error from " << source << " command=" << command << ": " << error_msg
+                << sendLog;
+            continue;
+        }
+
+        if (source == "Mount") {
+            updateTelescopeStatus(obj);
+        }
     }
 }
 
@@ -908,6 +940,9 @@ void Origin::updateTelescopeStatus(const std::string& jsonData)
 
         setTelLongLat(lonDeg, latDeg);
         setTelAltitude(50.0);
+	cos_lat = cos(deg2rad(latDeg));
+	sin_lat = sin(deg2rad(latDeg));
+	tan_lat = tan(deg2rad(latDeg));
 
         siteLocationSet = true;
         initialising = false;
@@ -940,18 +975,6 @@ void Origin::updateTelescopeStatus(const std::string& jsonData)
                 << sendLog;
             announcedCoords = true;
         }
-    }
-
-    // Alt/Az: only for diagnostics/horizon; not a “driver mode”
-    double altRad = NAN, azmRad = NAN;
-    bool haveAlt = getD("Alt", altRad);
-    bool haveAzm = getD("Azm", azmRad);
-    if (haveAlt && haveAzm) {
-        status->altitude = altRad;
-        status->azimuth  = azmRad;
-        have_valid_altaz = true;
-    } else {
-        have_valid_altaz = false;
     }
 
     // Tracking/slewing
